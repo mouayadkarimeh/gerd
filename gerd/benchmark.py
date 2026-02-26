@@ -61,12 +61,12 @@ RESULT_CSV_RAG_ONE_FILE = RESULTS_DIR / "grascco_benchmark_rag_one_file.csv"
 RESULT_CSV_WITHOUT_RAG = RESULTS_DIR / "grascco_benchmark_no_rag.csv"
 RESULT_CSV_WITHOUT_RAG_ONE_FILE = RESULTS_DIR / "grascco_benchmark_no_rag_one_file.csv"
 
-# LLM laden (wie vorher)
+# load llm
 model_config = load_qa_config().model
 llm = load_model_from_config(model_config)
 
 # -------------------------------------------
-# Prefix-Regeln je Label (erweiterbar) - korrekte Keys
+# Prefix-rules for each  Label to handle common patterns in predictions (e.g. "Patient: Anna Müller" for PatientName)
 # -------------------------------------------
 LABEL_PREFIXES = {
     "PatientName": [
@@ -140,10 +140,10 @@ BAD_PREFIX_RE = re.compile(
 THINK_BLOCK_RE = re.compile(r"<\s*tool_call\s*>.*?<\s*/\s*tool_call\s*>", re.IGNORECASE | re.DOTALL)
 
 # ----------------------------
-# 1. Regex-Definitionen
+# 1. Regex-Definitionen für die Extraktion von Namen, Geburtstagen, Aufnahmedaten und Entlassungsdaten
 # ----------------------------
 
-# Trigger-Phrasen, nach denen ein Name folgt
+# trigger for patient name: look for "Patient: Anna Müller" or "Der Patient heißt Anna Müller" etc.
 NAME_TRIGGER = re.compile(
     r"\bpatient\b\s*[:\-]?\s*"
     r"(?:is|ist|named)?\s*"
@@ -152,31 +152,31 @@ NAME_TRIGGER = re.compile(
 )
 
 
-# Name-Regex: 1–3 Wörter, Unicode-fähig
+# Name-Regex: 1–3 Words, Unicode, starting with capital letter, allowing common name characters
 NAME_RE = re.compile(
     r"\b([A-ZÄÖÜA-Za-z][a-zäöüßà-öø-ÿ]{2,}"
     r"(?:\s+[A-ZÄÖÜA-Za-z][a-zäöüßà-öø-ÿ]{2,}){0,2})\b",
     re.UNICODE
 )
 
-# Titel (sollen nicht als Patientennamen gelten)
+# These Titels should be excluded from names)
 TITLE_RE = re.compile(
     r"\b(dr|doctor|prof|professor|mr|mrs|ms|md|phd)\b", re.IGNORECASE
 )
 
-# Kliniken / Organisationen
+# clinics / Organisation keywords, to exclude cases like "Patientin wurde in der Charité aufgenommen"
 ORG_KEYWORDS = re.compile(
     r"\b(hospital|clinic|klinik|medical|center|centre|university|charité|health|care)\b",
     re.IGNORECASE
 )
 
-# Satzanfänge / Funktionswörter ausschließen
+# eliminate some non-usefull words
 NON_NAME_PREFIX_RE = re.compile(
     r"\b(it|the|mentions|looking|okay|this|that|these|those|user|wie|was|wo|wann)\b",
     re.IGNORECASE
 )
 
-# Alles nach Arzt-Titeln abschneiden
+# elliminate Words after dr-Titele 
 DOCTOR_CUTOFF_RE = re.compile(
     r"\b(dr|doctor|prof|professor|md)\b",
     re.IGNORECASE
@@ -193,7 +193,7 @@ def remove_think_tags(text: str) -> str:
     return THINK_TAG_RE.sub("", text)
 
 # ----------------------------
-# 3. Validierungsfunktion
+# 3. Validation funktion
 # ----------------------------
 def is_valid_person_name(name: str) -> bool:
     """Prüft, ob ein Name gültig ist (kein Titel, keine Klinik, kein Funktionswort)."""
@@ -208,18 +208,18 @@ def is_valid_person_name(name: str) -> bool:
     return True
 
 # ----------------------------
-# 4. Extraktionsfunktion
+# 4. Extraktion funktion
 # ----------------------------
 def extract_name_from_text(text: str) -> str:
-    # 1️⃣ Think-Tags entfernen
+    # eliminate Think-Tags 
     cleaned_text = remove_think_tags(text)
 
-    # 2️⃣ Alles nach Arzt-Titeln abschneiden
+    # eliminate words after  Arzt-Titeln 
     cutoff = DOCTOR_CUTOFF_RE.search(cleaned_text)
     if cutoff:
         cleaned_text = cleaned_text[:cutoff.start()]
 
-    # 3️⃣ Trigger-Suche
+    #  Trigger-Search
     trigger_match = NAME_TRIGGER.search(cleaned_text)
     if trigger_match:
         after_trigger = cleaned_text[trigger_match.end():]
@@ -228,7 +228,7 @@ def extract_name_from_text(text: str) -> str:
             if is_valid_person_name(name):
                 return name.strip()
 
-    # 4️⃣ Fallback: global suchen
+    # 4️⃣ Fallback: global search
     candidates = NAME_RE.findall(cleaned_text)
     for name in candidates:
         if is_valid_person_name(name):
@@ -279,11 +279,11 @@ BIRTHDAY_RE = re.compile(
 
 
 def extract_birthday_from_text(text: str) -> str:
-    # <tool_call>-Block berücksichtigen
+    # <tool_call>-Block observe
     think_matches = THINK_BLOCK_RE.findall(text)
     combined_text = " ".join(think_matches) if think_matches else text
 
-    # Nach Triggern suchen
+    #  Trigger-Search
     trigger_match = BIRTHDAY_TRIGGERS.search(combined_text)
     #print("birthday trigger match:", trigger_match)
     if trigger_match:
@@ -302,7 +302,7 @@ def extract_birthday_from_text(text: str) -> str:
             return candidates[0].strip()
         
 
-    # Kein Fallback mehr
+    # No Fallback anymore
     return "Nicht angegeben"    
 
 
@@ -422,7 +422,7 @@ def extract_release_date_from_text(text: str) -> str:
         if candidates:
             return candidates[0].strip()
         
-    # Kein Fallback mehr
+    # No Fallback anymore
     return "Nicht angegeben"
 
 
@@ -437,13 +437,13 @@ def clean_answer_strict(value: str) -> str:
     if not value:
         return "Nicht angegeben"
 
-    # 1. <think>...</think> vollständig entfernen
+    # 1. <tool_call>...<tool_call> eliminate
     value = THINK_BLOCK_RE.sub("", value)
 
-    # 2. BAD_PREFIXES nur am Anfang entfernen
+    # 2. BAD_PREFIXES eliminate at Begin 
     value = BAD_PREFIX_RE.sub("", value)
 
-    # 3. Nur erste nicht-leere Zeile behalten
+    # 3.just the first non-empty line
     for line in value.splitlines():
         line = line.strip()
         if line:
