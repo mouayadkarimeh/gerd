@@ -158,7 +158,7 @@ class QAService:
        
         if question.no_think and not question.question.strip().startswith("/no_think"):   #-> hier Änderung
             question.question = f"/no_think {question.question.strip()}"
-            _LOGGER.warning("Applied /no_think prefix to question: %s", question.question)
+            #_LOGGER.warning("Applied /no_think prefix to question: %s", question.question)
         """  
         file_path = RAW_TEXT_DIR / "Theodor.txt"
         text = file_path.read_text(encoding="utf-8")

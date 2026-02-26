@@ -8,6 +8,7 @@ The results are logged into CSV files for further analysis.
 import json
 import csv
 from pathlib import Path
+from pydoc import text
 from typing import Dict, List, Tuple, Optional
 from itertools import islice
 import logging
@@ -15,8 +16,10 @@ import re
 import os
 
 import dateparser
+from sympy import use
 
 # Falls du die gerd-Module lokal hast, lasse die Imports; sonst bitte anpassen.
+from gerd import rag
 from gerd.backends import TRANSPORTER
 from gerd.transport import QAFileUpload, QAQuestion
 from gerd.loader import load_model_from_config
@@ -31,19 +34,24 @@ project_dir = Path(__file__).parent.parent
 # ----------------------------------------------------
 # CONFIG
 # ----------------------------------------------------
+
+
+# questions.py
 QUESTIONS = [
     "Wie heißt der Patient?",
-    "Wann hat der Patient Geburtsdatum?",
-    "Wann wurde der Patient aufgenommen?",
-    "Wann wurde der Patient entlassen?",
+    "Wann hat der Patient Geburtstag?",
+    "Wann wurde der Patient bei uns aufgenommen?",
+    "Wann wurde der Patient bei uns entlassen?",
 ]
+
 
 LABEL_MAPPING = {
     "Wie heißt der Patient?": "PatientName",
-    "Wann hat der Patient Geburtsdatum?": "PatientGeburtsdatum",
-    "Wann wurde der Patient aufgenommen?": "AufnahmeDatum",
-    "Wann wurde der Patient entlassen?": "EntlassungsDatum",
+    "Wann hat der Patient Geburtstag?": "PatientGeburtsdatum",
+    "Wann wurde der Patient bei uns aufgenommen?": "AufnahmeDatum",
+    "Wann wurde der Patient bei uns entlassen?": "EntlassungsDatum",
 }
+
 
 FUZZY_THRESHOLD = 0.95
 RAW_TEXT_DIR = project_dir / "tests/data/grascco/raw"
@@ -95,9 +103,357 @@ LABEL_PREFIXES = {
     ],
 }
 
+
+
+
+
+
+
 # -------------------------------------------
 # Helpers 
 # -------------------------------------------
+
+
+
+
+import re
+
+BAD_PREFIXES = (
+    "okay",
+    "let's see",
+    "the user is asking",
+    "based on",
+    "from the context",
+    "wurde am",
+    "entließ",
+)
+
+BAD_PREFIX_RE = re.compile(
+    rf"^\s*(?:{'|'.join(map(re.escape, BAD_PREFIXES))})[\s,.:;-]*",
+    re.IGNORECASE
+)
+
+
+
+
+
+THINK_BLOCK_RE = re.compile(r"<\s*tool_call\s*>.*?<\s*/\s*tool_call\s*>", re.IGNORECASE | re.DOTALL)
+
+# ----------------------------
+# 1. Regex-Definitionen
+# ----------------------------
+
+# Trigger-Phrasen, nach denen ein Name folgt
+NAME_TRIGGER = re.compile(
+    r"\bpatient\b\s*[:\-]?\s*"
+    r"(?:is|ist|named)?\s*"
+    r"(?:herrn|herr|frau)?\s*",
+    re.IGNORECASE
+)
+
+
+# Name-Regex: 1–3 Wörter, Unicode-fähig
+NAME_RE = re.compile(
+    r"\b([A-ZÄÖÜA-Za-z][a-zäöüßà-öø-ÿ]{2,}"
+    r"(?:\s+[A-ZÄÖÜA-Za-z][a-zäöüßà-öø-ÿ]{2,}){0,2})\b",
+    re.UNICODE
+)
+
+# Titel (sollen nicht als Patientennamen gelten)
+TITLE_RE = re.compile(
+    r"\b(dr|doctor|prof|professor|mr|mrs|ms|md|phd)\b", re.IGNORECASE
+)
+
+# Kliniken / Organisationen
+ORG_KEYWORDS = re.compile(
+    r"\b(hospital|clinic|klinik|medical|center|centre|university|charité|health|care)\b",
+    re.IGNORECASE
+)
+
+# Satzanfänge / Funktionswörter ausschließen
+NON_NAME_PREFIX_RE = re.compile(
+    r"\b(it|the|mentions|looking|okay|this|that|these|those|user|wie|was|wo|wann)\b",
+    re.IGNORECASE
+)
+
+# Alles nach Arzt-Titeln abschneiden
+DOCTOR_CUTOFF_RE = re.compile(
+    r"\b(dr|doctor|prof|professor|md)\b",
+    re.IGNORECASE
+)
+
+# ----------------------------
+# 2. Preprocessing: Think-Tags entfernen
+# ----------------------------
+def remove_think_tags(text: str) -> str:
+    """
+    Entfernt nur die <think>-Tags, behält den Inhalt.
+    """
+    THINK_TAG_RE = re.compile(r"</?\s*think\s*>", re.IGNORECASE)
+    return THINK_TAG_RE.sub("", text)
+
+# ----------------------------
+# 3. Validierungsfunktion
+# ----------------------------
+def is_valid_person_name(name: str) -> bool:
+    """Prüft, ob ein Name gültig ist (kein Titel, keine Klinik, kein Funktionswort)."""
+    if TITLE_RE.search(name):
+        return False
+    if ORG_KEYWORDS.search(name):
+        return False
+    if NON_NAME_PREFIX_RE.match(name):
+        return False
+    if name.lower() == "think":  # Sicherheit gegen Artefakte
+        return False
+    return True
+
+# ----------------------------
+# 4. Extraktionsfunktion
+# ----------------------------
+def extract_name_from_text(text: str) -> str:
+    # 1️⃣ Think-Tags entfernen
+    cleaned_text = remove_think_tags(text)
+
+    # 2️⃣ Alles nach Arzt-Titeln abschneiden
+    cutoff = DOCTOR_CUTOFF_RE.search(cleaned_text)
+    if cutoff:
+        cleaned_text = cleaned_text[:cutoff.start()]
+
+    # 3️⃣ Trigger-Suche
+    trigger_match = NAME_TRIGGER.search(cleaned_text)
+    if trigger_match:
+        after_trigger = cleaned_text[trigger_match.end():]
+        candidates = NAME_RE.findall(after_trigger)
+        for name in candidates:
+            if is_valid_person_name(name):
+                return name.strip()
+
+    # 4️⃣ Fallback: global suchen
+    candidates = NAME_RE.findall(cleaned_text)
+    for name in candidates:
+        if is_valid_person_name(name):
+            return name.strip()
+
+    return "Nicht angegeben"
+
+
+
+
+BIRTHDAY_TRIGGERS = re.compile(
+    r"(?:"
+    r"geburtsdatum|geb\.|geboren|geburtstag||"
+    r"born on|date of birth|dob|birthday"
+    r")"
+    r"(?:\s+(?:am|im|on))?"
+    r"[:\s]*",
+    re.IGNORECASE
+)
+
+
+MONTHS = (
+    "januar|februar|märz|maerz|april|mai|juni|juli|"
+    "august|september|oktober|november|dezember|"
+    "january|february|march|april|may|june|july|"
+    "august|september|october|november|december"
+)
+
+
+
+
+BIRTHDAY_RE = re.compile(
+    rf"\b("
+    # 15. März 1980 / 15 März 1980
+    rf"\d{{1,2}}\.?\s+(?:{MONTHS})\s+\d{{4}}"
+    rf"|"
+    # March 23, 1968
+    rf"(?:{MONTHS})\s+\d{{1,2}},\s*\d{{4}}"
+    rf"|"
+    # 23.03.1968 / 23-03-68
+    rf"\d{{1,2}}[.\-/]\d{{1,2}}[.\-/]\d{{2,4}}"
+    rf"|"
+    # 1968-03-23
+    rf"\d{{4}}[.\-/]\d{{1,2}}[.\-/]\d{{1,2}}"
+    rf")\b",
+    re.IGNORECASE
+)
+
+
+def extract_birthday_from_text(text: str) -> str:
+    # <tool_call>-Block berücksichtigen
+    think_matches = THINK_BLOCK_RE.findall(text)
+    combined_text = " ".join(think_matches) if think_matches else text
+
+    # Nach Triggern suchen
+    trigger_match = BIRTHDAY_TRIGGERS.search(combined_text)
+    #print("birthday trigger match:", trigger_match)
+    if trigger_match:
+        after_trigger = combined_text[trigger_match.end():]
+        before_trigger = combined_text[:trigger_match.start()]  
+        #print("after birthday trigger:", after_trigger)
+        #print("before birthday trigger:", before_trigger)
+        
+        candidates = BIRTHDAY_RE.findall(after_trigger)
+        #print("candidates after trigger:", candidates)
+        if not candidates:
+            candidates = BIRTHDAY_RE.findall(before_trigger)
+            #print("candidates before trigger:", candidates)
+        
+        if candidates:
+            return candidates[0].strip()
+        
+
+    # Kein Fallback mehr
+    return "Nicht angegeben"    
+
+
+RECORDING_TRIGGER = re.compile(
+    r"\b(?:aufnahmedatum|aufnahme|admission date|treated|to|wurde|was checked from)"
+    r"(?:\s+(?:am|on))?"
+    r"[:\s]*",
+    re.IGNORECASE
+)
+
+RECORDING_DATE_RE = re.compile(
+    r"\b("
+    # 15. März 1980 / 15 März 1980
+    r"\d{1,2}\.?\s+"
+    r"(?:januar|februar|märz|maerz|april|mai|juni|juli|"
+    r"august|september|oktober|november|dezember)\s+\d{4}"
+    r"|"
+    # 23 March 1968
+    r"\d{1,2}\s+"
+    r"(?:january|february|march|april|may|june|july|"
+    r"august|september|october|november|december)\s+\d{4}"
+    r"|"
+    # March 23, 1968 / Jan 24, 2028 / Sep 3, 2021
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+    r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|"
+    r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+    r"\s+\d{1,2},\s+\d{4}"
+    r"|"
+    # 23.03.1968 / 23-03-68 / 23/03/1968
+    r"\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}"
+    r"|"
+    # 1968-03-23
+    r"\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}"
+    r")\b",
+    re.IGNORECASE
+)
+
+
+
+
+def extract_recording_date_from_text(text: str) -> str:
+    # <tool_call>-Block berücksichtigen
+    think_matches = THINK_BLOCK_RE.findall(text)
+    combined_text = " ".join(think_matches) if think_matches else text
+
+    # Nach Triggern suchen
+    trigger_match = RECORDING_TRIGGER.search(combined_text)
+    #print("recording date trigger match:", trigger_match)
+    if trigger_match:
+        after_trigger = combined_text[trigger_match.end():]
+        #print("after recording date trigger:", after_trigger)
+        
+        candidates = RECORDING_DATE_RE.findall(after_trigger)
+        #print("candidates after trigger:", candidates)
+        
+        if candidates:
+            return candidates[0].strip()
+        
+    # Kein Fallback mehr
+    return "Nicht angegeben"
+
+
+
+
+RELEASE_DATE_TRIGGER = re.compile(
+    r"\b(?:entlassungsdatum|entlassung|entlassen|entließ|release date|discharge date|released|discharged|to|bis zum)"
+    r"(?:\s+(?:am|on))?"
+    r"[:\s]*",
+    re.IGNORECASE
+)
+
+RELEASE_DATE_RE = re.compile(
+    r"\b("
+    # 15. März 1980 / 15 März 1980
+    r"\d{1,2}\.?\s+"
+    r"(?:januar|februar|märz|maerz|april|mai|juni|juli|"
+    r"august|september|oktober|november|dezember)\s+\d{4}"
+    r"|"
+    # 23 March 1968
+    r"\d{1,2}\s+"
+    r"(?:january|february|march|april|may|june|july|"
+    r"august|september|october|november|december)\s+\d{4}"
+    r"|"
+    # March 23, 1968 / Jan 24, 2028 / Sep 3, 2021
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+    r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|"
+    r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+    r"\s+\d{1,2},\s+\d{4}"
+    r"|"
+    # 23.03.1968 / 23-03-68 / 23/03/1968
+    r"\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}"
+    r"|"
+    # 1968-03-23
+    r"\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}"
+    r")\b",
+    re.IGNORECASE
+)
+
+
+
+
+def extract_release_date_from_text(text: str) -> str:
+    # <tool_call>-Block berücksichtigen
+    think_matches = THINK_BLOCK_RE.findall(text)
+    combined_text = " ".join(think_matches) if think_matches else text
+
+    # Nach Triggern suchen
+    trigger_match = RELEASE_DATE_TRIGGER.search(combined_text)
+    #print("release date trigger match:", trigger_match)
+    if trigger_match:
+        after_trigger = combined_text[trigger_match.end():]
+        #print("after release date trigger:", after_trigger)
+
+        candidates = RELEASE_DATE_RE.findall(after_trigger)
+        #print("candidates after trigger:", candidates)
+        
+        if candidates:
+            return candidates[0].strip()
+        
+    # Kein Fallback mehr
+    return "Nicht angegeben"
+
+
+
+
+
+
+
+
+
+def clean_answer_strict(value: str) -> str:
+    if not value:
+        return "Nicht angegeben"
+
+    # 1. <think>...</think> vollständig entfernen
+    value = THINK_BLOCK_RE.sub("", value)
+
+    # 2. BAD_PREFIXES nur am Anfang entfernen
+    value = BAD_PREFIX_RE.sub("", value)
+
+    # 3. Nur erste nicht-leere Zeile behalten
+    for line in value.splitlines():
+        line = line.strip()
+        if line:
+            return line
+
+    return "Nicht angegeben"
+
+
+
+
 
 def normalize(s: str) -> str:
     return " ".join((s or "").lower().strip().split())
@@ -366,11 +722,17 @@ def evaluate_prediction(gt: str, pred: str, label: str) -> Tuple[float, bool]:
 # Prompt
 # -------------------------------------------
 
-def make_prompt(text: str, question: str) -> str:
+
+
+
+def make_prompt_german(text: str, question: str, no_think: bool) -> str:
+    question = f"/no_think {question}" if no_think else question
+
     return f"""Gib ausschließlich den exakten Wortlaut zurück, wie er im Text vorkommt.
-Keine Sätze. Keine Erklärungen. Nur den wörtlichen relevanten Text.
-Antworte mit 'Unbekannt', wenn die Information im Text nicht vorhanden ist.
-Auf deutsche Sprache antworten.
+Keine vollständigen Sätze. Keine Erklärungen. Keine zusätzlichen Wörter.
+Gib nur den wörtlich relevanten Text zurück.
+Antworte mit 'Unbekannt', falls die Information im Text nicht enthalten ist.
+
 
 Text:
 {text}
@@ -380,29 +742,32 @@ Frage:
 """.strip()
 
 
-
-def make_prompt_no_rag(text:str, question:str, no_think: bool) -> str:
+def make_prompt_englich(text: str, question: str, no_think: bool) -> str:
     question = f"/no_think {question}" if no_think else question
-    
-    return f"""
-    Gib ausschließlich den exakten Wortlaut zurück, wie er im Text vorkommt.
-Keine Sätze. Keine Erklärungen. Nur den wörtlichen relevanten Text.
-Antworte mit 'Unbekannt', wenn die Information im Text nicht vorhanden ist.
-Auf deutsche Sprache antworten.
+
+    return f"""Return only the exact wording as it appears in the text.
+No full sentences. No explanations. No additional words.
+Return the literal relevant text only.
+Answer with 'Unknown' if the information is not present in the text.
+
 
 Text:
-{text}  
+{text}
 
-
-Frage:    
-{question}    
+Question:
+{question}
 """.strip()
+
 # -------------------------------------------
-# BENCHMARK-Funktions (RAG / Single-File RAG / No-RAG)
+# BENCHMARK-Funktions 
 # -------------------------------------------
 
 
-def run_benchmark_rag(max_files: int , no_think_option: bool):
+
+
+
+
+def run_benchmark(max_files: int, use_rag: bool, no_think_option: bool):
     """Run benchmark with RAG approach.
     tests a set of files against the provided questions .
     truth answers are extracted from the grascco annotations.
@@ -412,12 +777,15 @@ def run_benchmark_rag(max_files: int , no_think_option: bool):
         
         Parameters:
             max_files (int): Maximum number of files to process.
+            use_rag (bool): Whether to use RAG or not.
             no_think_option (bool): Whether to use the 'no_think' option in the QAQuestion.
 
         Returns:
             None
     """
-   
+    _LOGGER.info("**************Benchmark___Rag*********")
+    _LOGGER.info(f"Model: {model_config.name}")
+    _LOGGER.info(f"'no_think': {no_think_option}")
     ann = load_grascco_annotations()
     rows = []
     total = 0
@@ -427,57 +795,89 @@ def run_benchmark_rag(max_files: int , no_think_option: bool):
 
     for file_path in files:
         fname = file_path.name.replace("ö", "o")
+
         if fname not in ann:
-            _LOGGER.warning(f"no annotation for {fname}")
+            _LOGGER.warning(f"No annotation for {fname}")
             continue
 
         annotation_entry = ann[fname]
         text = file_path.read_text(encoding="utf-8")
 
-        # Reset + Upload
-        try:
-            _LOGGER.info("reset Vectorstore...")
-            TRANSPORTER.clear_vectorstore()  # oder reset_vectorstore()
-            _LOGGER.info("Vectorstore succesfuly reseted.")
-        except Exception as e:
-            _LOGGER.error("Error by reset vectorstore", exc_info=True)
-            raise e
+        # ---------------------------
+        # Reset + Upload Vectorstore
+        # ---------------------------
+        if use_rag:
+            try:
+                TRANSPORTER.clear_vectorstore()
+            except Exception:
+                _LOGGER.exception("Failed to reset vectorstore")
+                continue
+            upload = QAFileUpload(data=text.encode("utf-8"), name=fname)
+            res = TRANSPORTER.add_file(upload)
+            if getattr(res, "status", None) != 200:
+                _LOGGER.error(f"Upload failed for {fname}")
+                continue
 
+        if use_rag:
+            for question in QUESTIONS:
+                total += 1
+                label = LABEL_MAPPING[question]
+                truth_answer = extract_label_text(annotation_entry, label, text)
+                prompt = make_prompt_englich(text=text, question=question, no_think=no_think_option)
+                #_LOGGER.info(prompt)
+                q = QAQuestion(question = prompt, search_strategy="similarity", max_sources=3,no_think=no_think_option)
+            
+                qa_res = TRANSPORTER.qa_query(q)
+                pred_answer = qa_res.response 
+        else:
+            for question in QUESTIONS:
+                total += 1
+                label = LABEL_MAPPING[question]
+                truth_answer = extract_label_text(annotation_entry, label, text)
+                prompt = make_prompt_englich(text=text, question=question, no_think=no_think_option)
+                try:
+                    qa_res = llm.create_chat_completion(messages=[{"role": "user", "content": prompt}])
+                except Exception as e:
+                    _LOGGER.warning(f"WARNUNG: LLM-Aufruf für {fname} ist fehlgeschlagen: {e}")
+                    qa_res = None
 
-        upload = QAFileUpload(data=text.encode("utf-8"), name=fname)
-        res = TRANSPORTER.add_file(upload)
-        if getattr(res, "status", None) != 200:
-            _LOGGER.error(f"Error by loading: {getattr(res, 'error_msg', res)}")
-            continue
+                pred_answer = ""
+                if isinstance(qa_res, tuple) and len(qa_res) == 2:
+                    pred_answer = qa_res[1] or ""
+                else:
+                    if hasattr(qa_res, "response"):
+                        pred_answer = qa_res.response or ""
+                    elif isinstance(qa_res, dict) and "response" in qa_res:
+                        pred_answer = qa_res.get("response") or ""
+                    else:
+                        pred_answer = ""
 
-        for question in QUESTIONS:
-            total += 1
-            label = LABEL_MAPPING[question]
-            truth_answer = extract_label_text(annotation_entry, label, text)
+        #pred = clean_pred(pred_answer)
 
-            #prompt = make_prompt(text, question)
-            q = QAQuestion(question=question, search_strategy="similarity", max_sources=3, no_think= no_think_option)
-            qa_res = TRANSPORTER.qa_query(q)
-            pred_answer = qa_res.response
-            #pred_answer = clean_pred(getattr(qa_res, "response", ""))
 
             score, match = evaluate_prediction(truth_answer, pred_answer, label)
+            
             if match:
                 correct += 1
 
-            _LOGGER.info(f"{fname:25} | {question:35} | GT: {truth_answer!r:30} | PRED: {pred_answer!r:30} | score={score:.2f} | match={match}")
+            _LOGGER.info( f"{fname:25} | {label:18} | Q: {question:35} | GT: {truth_answer!r:25} | "
+                          f"PRED: {pred_answer!r:25} | score={score:.2f} | match={match}"
+            )
 
             rows.append({
                 "file": fname,
-                "question": question,
                 "label": label,
+                "question_used": question,
                 "ground_truth": truth_answer,
                 "predicted": pred_answer,
                 "match_score": f"{score:.3f}",
                 "match": match,
             })
 
-    acc = correct / total if total else 0
+    # ---------------------------
+    # Final metrics
+    # ---------------------------
+    acc = correct / total if total else 0.0
     _LOGGER.info("================================================")
     _LOGGER.info(f"FINAL SCORE: {correct}/{total}  accuracy={acc:.3f}")
     _LOGGER.info("================================================")
@@ -488,186 +888,13 @@ def run_benchmark_rag(max_files: int , no_think_option: bool):
             writer = csv.DictWriter(f, fieldnames=rows[0].keys())
             writer.writeheader()
             writer.writerows(rows)
-        _LOGGER.info(f"Resultes saved in: {RESULT_CSV_RAG}")
 
-
-def run_benchmark_Rag_one_file(no_think_option: bool):
-    
-    """Run benchmark with RAG approach for any file separatly .
-    test one file against the provided questions .
-    truth answers are extracted from the grascco annotations.
-    compares the returnned predicted answers with truth answers using evaluate_prediction.
-    computes accuracy over all questions and files 
-        and logs the results into a CSV file.
-        
-        Parameters:
-            no_think_option (bool): Whether to use the 'no_think' option in the QAQuestion.
-
-        Returns:
-            None
-    """
-     
-    _LOGGER.info("**************Benchmark___Rag___one___file*********")
-    ann = load_grascco_annotations()
-    rows = []
-    total = 0
-    correct = 0
-
-    file_path = RAW_TEXT_DIR / "Neubauer.txt"
-    fname = file_path.name.replace("ö", "o")
-    _LOGGER.info(f"Datei: {fname}")
-    _LOGGER.info(f"Model: {model_config.name}")
-    _LOGGER.info(f"'no_think': {no_think_option}")   
-
-    if fname not in ann:
-        _LOGGER.warning(f"Keine Annotation für {fname}")
-        return
-
-    annotation_entry = ann[fname]
-    text = file_path.read_text(encoding="utf-8")
-
-    # Reset + Upload
-    try:
-        TRANSPORTER.remove_file(fname)
-    except Exception:
-        _LOGGER.debug(f"Fehler beim Entfernen der Datei {fname} (vielleicht existiert sie nicht).")
-
-    upload = QAFileUpload(data=text.encode("utf-8"), name=fname)
-    res = TRANSPORTER.add_file(upload)
-    if getattr(res, "status", None) != 200:
-        _LOGGER.error(f"Fehler beim Laden: {getattr(res, 'error_msg', res)}")
-
-    for question in QUESTIONS:
-        total += 1
-        label = LABEL_MAPPING[question]
-        truth_answer = extract_label_text(annotation_entry, label, text)
-        #prompt = make_prompt(text, question)
-        qa_question = QAQuestion(question=question ,  search_strategy="similarity", max_sources=3, no_think= no_think_option)
-        qa_answer = TRANSPORTER.qa_query(qa_question) 
-       
-        
-        pred_answer = qa_answer.response
-        #pred_answer = clean_pred(getattr(qa_res, "response", ""))
-
-        score, match = evaluate_prediction(truth_answer, pred_answer, label)
-        if match:
-            correct += 1
-
-        _LOGGER.info(f"{fname:25} | {question:35} | GT: {truth_answer!r:30} | PRED: {pred_answer!r:30} | score={score:.2f} | match={match}")
-
-        rows.append({
-            "file": fname,
-            "question": question,
-            "label": label,
-            "ground_truth": truth_answer,
-            "predicted": pred_answer,
-            "match_score": f"{score:.3f}",
-            "match": match,
-        })
-
-    acc = correct / total if total else 0
-    _LOGGER.info("================================================")
-    _LOGGER.info(f"FINAL SCORE: {correct}/{total}  accuracy={acc:.3f}")
-    _LOGGER.info("================================================")
-
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    if rows:
-        with RESULT_CSV_RAG_ONE_FILE.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-            writer.writeheader()
-            writer.writerows(rows)
-        _LOGGER.info(f"Ergebnisse gespeichert in: {RESULT_CSV_RAG_ONE_FILE}")
-
-
-def run_benchmark_no_rag(max_files: int ,  no_think_option: bool):
-    
-    """Run benchmark withot RAG approach using llm directly.
-    acsess the llm directly without qa_service 
-    tests a set of files against the provided questions .
-    truth answers are extracted from the grascco annotations.
-    compares the returnned predicted answers with truth answers using evaluate_prediction.
-    computes accuracy over all questions and files 
-        and logs the results into a CSV file.
-        
-        Parameters:
-            max_files (int): Maximum number of files to process.
-            no_think_option (bool): Whether to use the 'no_think' option in the QAQuestion.
-
-        Returns:
-            None
-    """
-    _LOGGER.info("************************Benchmark___no___Rag************************")
-    ann = load_grascco_annotations()
-    rows = []
-    total = 0
-    correct = 0
-    files = islice(sorted(RAW_TEXT_DIR.glob("*.txt")), max_files) 
-    for file_path in files:
-        fname = file_path.name.replace("ö", "o")
-        if fname not in ann:
-            _LOGGER.warning(f"Keine Annotation für {fname}")
-            continue
-
-        annotation_entry = ann[fname]
-        text = file_path.read_text(encoding="utf-8")
-
-        _LOGGER.info(f"Datei: {fname}")
-        _LOGGER.info(f"Model: {model_config.name}")
-        _LOGGER.info(f"'no_think' ist auf {no_think_option} gesetzt.")
-
-        for question in QUESTIONS:
-            total += 1
-            label = LABEL_MAPPING[question]
-            truth_answer = extract_label_text(annotation_entry, label, text)
-            prompt = make_prompt_no_rag(text, question, no_think_option)
-
-            try:
-                qa_res = llm.create_chat_completion(messages=[{"role": "user", "content": prompt}])
-            except Exception as e:
-                _LOGGER.warning(f"WARNUNG: LLM-Aufruf für {fname} ist fehlgeschlagen: {e}")
-                qa_res = None
-
-            pred_answer_without_Rag = ""
-            if isinstance(qa_res, tuple) and len(qa_res) == 2:
-                pred_answer_without_Rag = qa_res[1] or ""
-            else:
-                if hasattr(qa_res, "response"):
-                    pred_answer_without_Rag = qa_res.response or ""
-                elif isinstance(qa_res, dict) and "response" in qa_res:
-                    pred_answer_without_Rag = qa_res.get("response") or ""
-                else:
-                    pred_answer_without_Rag = ""
-
-            score, match = evaluate_prediction(truth_answer, pred_answer_without_Rag, label)
-            if match:
-                correct += 1
-
-            _LOGGER.info(f"{fname:25} | {question:35} | GT: {truth_answer!r:30} | PRED: {pred_answer_without_Rag!r:30} | score={score:.2f} | match={match}")
-            #_LOGGER.info("------------------------------------------------")
-            rows.append({
-                "file": fname,
-                "question": question,
-                "label": label,
-                "ground_truth": truth_answer,
-                "predicted": pred_answer_without_Rag,
-                "match_score": f"{score:.3f}",
-                "match": match,
-            })
-    acc = correct / total if total else 0
-    _LOGGER.info("================================================")
-    _LOGGER.info(f"FINAL SCORE: {correct}/{total}  accuracy={acc:.3f}")
-    _LOGGER.info("================================================")
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    if rows:
-        with RESULT_CSV_WITHOUT_RAG.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-            writer.writeheader()
-            writer.writerows(rows)
-        _LOGGER.info(f"Ergebnisse gespeichert in: {RESULT_CSV_WITHOUT_RAG}")
+        _LOGGER.info(f"Results saved in: {RESULT_CSV_RAG}")
 
 
 
-def run_benchmark_no_rag_one_file(no_think_option: bool):
+
+def run_benchmark_one_file(file_path: Path, use_rag: bool, no_think_option: bool):
     
     """Run benchmark withot RAG approach for any file accessing llm directly for one file.
     acsess the llm directly without qa_service
@@ -683,7 +910,7 @@ def run_benchmark_no_rag_one_file(no_think_option: bool):
         Returns:
             None
     """
-    _LOGGER.info("************************Benchmark___no___Rag__one__file************************")
+    _LOGGER.info("************************Benchmark__one__file************************")
 
 
     ann = load_grascco_annotations()
@@ -691,61 +918,79 @@ def run_benchmark_no_rag_one_file(no_think_option: bool):
     total = 0
     correct = 0
 
-    file_path = RAW_TEXT_DIR / "Beuerle.txt"
+    
     fname = file_path.name.replace("ö", "o")
 
     if fname not in ann:
         _LOGGER.warning(f"Keine Annotation für {fname}")
         return
-
     annotation_entry = ann[fname]
     text = file_path.read_text(encoding="utf-8")
 
     _LOGGER.info(f"Datei: {fname}")
     _LOGGER.info(f"Model: {model_config.name}")
     _LOGGER.info(f"'no_think' ist auf {no_think_option} gesetzt.")
-    
 
-    for question in QUESTIONS:
-        total += 1
-        label = LABEL_MAPPING[question]
-        truth_answer = extract_label_text(annotation_entry, label, text)
-        prompt = make_prompt_no_rag(text, question, no_think_option)
-        #_LOGGER.info("prompt: %s", prompt)
+    if use_rag:
+        try:
+            TRANSPORTER.remove_file(fname)
+        except Exception:
+            _LOGGER.debug(f"Fehler beim Entfernen der Datei {fname} (vielleicht existiert sie nicht).")
 
+        upload = QAFileUpload(data=text.encode("utf-8"), name=fname)
+        res = TRANSPORTER.add_file(upload)
+        if getattr(res, "status", None) != 200:
+            _LOGGER.error(f"Fehler beim Laden: {getattr(res, 'error_msg', res)}")
 
-        
+    if use_rag:
+        for question in QUESTIONS:
+            total += 1
+            label = LABEL_MAPPING[question]
+            truth_answer = extract_label_text(annotation_entry, label, text)
+            prompt = make_prompt_englich(text, question, no_think_option)
+            #_LOGGER.info("prompt: %s", prompt)
+            qa_question = QAQuestion(question= prompt ,  search_strategy="similarity", max_sources=3, no_think= no_think_option)  
+            qa_answer = TRANSPORTER.qa_query(qa_question) 
+            pred_answer = qa_answer.response
+            #_LOGGER.info("RAG-Antwort: %s", pred_answer)
+            
+    else:
+        for question in QUESTIONS:
+            total += 1
+            label = LABEL_MAPPING[question]
+            truth_answer = extract_label_text(annotation_entry, label, text)
+            prompt = make_prompt_englich(text, question, no_think_option)    
         try:
             qa_res = llm.create_chat_completion(messages=[{"role": "user", "content": prompt}])
         except Exception as e:
             _LOGGER.warning(f"WARNUNG: LLM-Aufruf für {fname} ist fehlgeschlagen: {e}")
             qa_res = None
 
-        pred_answer_without_Rag = ""
+        pred = ""
         if isinstance(qa_res, tuple) and len(qa_res) == 2:
-            pred_answer_without_Rag = qa_res[1] or ""
+            pred = qa_res[1] or ""
         else:
             if hasattr(qa_res, "response"):
-                pred_answer_without_Rag = qa_res.response or ""
+                pred = qa_res.response or ""
             elif isinstance(qa_res, dict) and "response" in qa_res:
-                pred_answer_without_Rag = qa_res.get("response") or ""
+                pred = qa_res.get("response") or ""
             else:
-                pred_answer_without_Rag = ""
+                pred = ""
 
-        #pred_answer_without_Rag = clean_pred(pred_answer_without_Rag)
+        #pred = clean_pred(pred)
 
-        score, match = evaluate_prediction(truth_answer, pred_answer_without_Rag, label)
+        score, match = evaluate_prediction(truth_answer, pred, label)
         if match:
             correct += 1
 
-        _LOGGER.info(f"{fname:25} | {question:35} | GT: {truth_answer!r:30} | PRED: {pred_answer_without_Rag!r:30} | score={score:.2f} | match={match}")
+        _LOGGER.info(f"{fname:25} | {question:35} | GT: {truth_answer!r:30} | PRED: {pred!r:30} | score={score:.2f} | match={match}")
 
         rows.append({
             "file": fname,
             "question": question,
             "label": label,
             "ground_truth": truth_answer,
-            "predicted": pred_answer_without_Rag,
+            "predicted": pred,
             "match_score": f"{score:.3f}",
             "match": match,
         })
@@ -757,11 +1002,114 @@ def run_benchmark_no_rag_one_file(no_think_option: bool):
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     if rows:
-        with RESULT_CSV_WITHOUT_RAG.open("w", newline="", encoding="utf-8") as f:
+        with RESULT_CSV_WITHOUT_RAG_ONE_FILE.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=rows[0].keys())
             writer.writeheader()
             writer.writerows(rows)
         _LOGGER.info(f"Ergebnisse gespeichert in: {RESULT_CSV_WITHOUT_RAG_ONE_FILE}")
+
+
+
+def profile(file_path: Path,use_rag: bool,no_think: bool):
+    """
+    Beantwortet definierte Fragen zu einem Entlassungsbrief
+    und speichert alle Antworten gesammelt in einer Textdatei.
+    """
+    print(f"********Profile*********")
+    text = file_path.read_text(encoding="utf-8")
+    _LOGGER.info(f"Datei: {file_path.name}")
+    _LOGGER.info(f"Model: {model_config.name}")
+    _LOGGER.info("RAG: %s", use_rag)
+    _LOGGER.info("no_think: %s", no_think)
+    answers: dict[str, str] = {}
+
+    # =========================
+    # RAG-SETUP
+    # =========================
+    if use_rag:
+        try:
+            TRANSPORTER.clear_vectorstore()
+        except Exception:
+            pass
+
+        upload = QAFileUpload(data=text.encode("utf-8"), name=file_path.name)
+        res = TRANSPORTER.add_file(upload)
+        if getattr(res, "status", None) != 200:
+            raise RuntimeError("Upload in Vectorstore fehlgeschlagen")
+
+    # =========================
+    # FRAGEN-SCHLEIFE
+    # =========================
+    for question in QUESTIONS:
+        if use_rag:
+            prompt = make_prompt_englich(text, question, no_think)
+            q = QAQuestion( 
+                question= prompt,
+                search_strategy="similarity",
+                max_sources=3,
+                no_think=no_think
+            )
+            
+            res = TRANSPORTER.qa_query(q)
+            raw_answer = res.response
+            answers[question] = raw_answer
+            #print(" *****Antwort*****", answers[question])
+
+        else:
+            prompt = make_prompt_englich(text, question, no_think)
+            res = llm.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+            if isinstance(res, tuple) and len(res) == 2:
+                raw_answer = res[1] or ""
+
+            else:
+                raw_answer = getattr(res, "response", "") or ""
+            answers[question] = raw_answer
+
+        #answers[question] = raw_answer
+        #print(" *****Alle Antworten*****", answers)
+    
+    # =========================
+    # SORTIERTE TEXTAUSGABE
+    # =========================
+    print("************")
+    print(answers.get("Wie heißt der Patient?", "Nicht angegeben"))
+    print("************")
+    print(answers.get("Wann hat der Patient Geburtstag?", "Nicht angegeben"))
+    print("************")
+    print(answers.get("Wann wurde der Patient bei uns aufgenommen?", "Nicht angegeben"))
+    print("************")
+    print(answers.get("Wann wurde der Patient bei uns entlassen?", "Nicht angegeben"))
+    lines = [
+        "Kurzprofil Entlassungsbrief\n",
+        f"Patient: {extract_name_from_text(answers.get('Wie heißt der Patient?', 'Nicht angegeben'))}",
+        f"Geburtsdatum: {extract_birthday_from_text(answers.get('Wann hat der Patient Geburtstag?', 'Nicht angegeben'))}",
+        f"Aufnahme: {extract_recording_date_from_text(answers.get('Wann wurde der Patient bei uns aufgenommen?', 'Nicht angegeben'))}",
+        f"Entlassung: {extract_release_date_from_text(answers.get('Wann wurde der Patient bei uns entlassen?', 'Nicht angegeben'))}",
+    ]
+
+    summary = "\n".join(lines).strip()
+    print(summary)
+
+    # =========================
+    # SPEICHERN
+    # =========================
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = RESULTS_DIR / f"{file_path.stem}_profile.txt"
+    out_path.write_text(summary, encoding="utf-8")
+    _LOGGER.info("Profil gespeichert unter: %s", out_path)
+
+
+    
+
+
+
+
+
+
+
 
 
 # -------------------------------------------
@@ -770,11 +1118,9 @@ def run_benchmark_no_rag_one_file(no_think_option: bool):
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
-        format="%(levelname)s:%(name)s: %(message)s"
-    )
+        format="%(levelname)s:%(name)s: %(message)s")
 
-    #run_benchmark_rag(max_files = 5, no_think_option= True)
-    #run_benchmark_Rag_one_file(no_think_option=True)
-    run_benchmark_no_rag(max_files = 5 , no_think_option=True)
-    #run_benchmark_no_rag_one_file(no_think_option=True)
+    #run_benchmark(max_files = 5, use_rag=True, no_think_option= True)
+    #run_benchmark_one_file(file_path=RAW_TEXT_DIR / "Cajal.txt", use_rag=True, no_think_option=False)
+    profile(file_path=RAW_TEXT_DIR / "Cajal.txt", use_rag=True, no_think= True)
     
