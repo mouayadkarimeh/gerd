@@ -7,16 +7,23 @@ and view relevant sources and answers.
 """
 
 import logging
+import pathlib
+from os import unlink
 from pathlib import Path
-from typing import Optional
+from tempfile import NamedTemporaryFile
+from typing import List, Optional
+from xml.dom.minidom import Document
 
 import gradio as gr
+from jinja2 import BaseLoader
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_community.vectorstores import FAISS
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from gerd.backends import TRANSPORTER
 from gerd.config import CONFIG, load_qa_config
-from gerd.rag import load_faiss
-from gerd.transport import QAFileUpload, QAQuestion
+from gerd.rag import create_faiss, load_faiss
+from gerd.transport import DocumentSource, FileTypes, QAAnswer, QAFileUpload, QAQuestion
 
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.addHandler(logging.NullHandler())
@@ -42,21 +49,21 @@ def initialize_store() -> None:
         none
     """
     global store
-    db_path = Path(qa_config.embedding.db_path)
-    index_file = db_path / "index.faiss"
-    if not index_file.exists():
-        _LOGGER.warning(
-            "FAISS index not found at %s. Please upload documents to create the index.",
-            index_file,
+    if (
+        qa_config.embedding.db_path
+        and Path(qa_config.embedding.db_path, "index.faiss").exists()
+    ):
+        _LOGGER.info("faiss path does not exist %s", qa_config.embedding.db_path)
+        store = load_faiss(
+            qa_config.embedding.db_path,
+            qa_config.embedding.model.name,
+            qa_config.device,
         )
-        store = None
-        return
-    try:
-        store = load_faiss(db_path, qa_config.embedding.model.name, qa_config.device)
-        _LOGGER.info("FAISS index loaded.")
-        _LOGGER.info("Vectors in index: %d", store.index.ntotal)
-    except Exception as e:
-        _LOGGER.error("Error loading FAISS index: %s", e)
+    else:
+        _LOGGER.info(
+            "FAISS index not found at %s. Please upload documents to create the index.",
+            qa_config.embedding.db_path,
+        )
         store = None
 
 
@@ -78,36 +85,79 @@ def change_model(name: str) -> None:
     _LOGGER.info("Model switched to: %s", name)
 
 
+store_set: set[str] = set()
+
+
 # -----------------------------
 # Upload Files
 # -----------------------------
-def files_changed(files: Optional[list[str]]) -> str:
-    """Handle file uploads.
+def files_changed(file_paths: Optional[list[str]]) -> None:
+    """Check if the file upload element has changed.
+
+    If so, upload the new files to the vectorstore and delete the one that
+    have been removed.
 
     Parameters:
-        files (Optional[list[str]]): List of uploaded file paths.
+        file_paths: The file paths to upload
+    """
+    file_paths = file_paths or []
+    progress = gr.Progress()
+    new_set = set(file_paths)
+    new_files = new_set - store_set
+    delete_files = store_set - new_set
+    for new_file in new_files:
+        store_set.add(new_file)
+        with pathlib.Path(new_file).open("rb") as file:
+            data = QAFileUpload(
+                data=file.read(),
+                name=pathlib.Path(new_file).name,
+            )
+        res = TRANSPORTER.add_file(data)
+        if res.status != 200:
+            _LOGGER.warning(
+                "Data upload failed with error code: %d\nReason: %s",
+                res.status,
+                res.error_msg,
+            )
+            msg = (
+                f"Datei konnte nicht hochgeladen werden: {res.error_msg}"
+                "(Error Code {res.status})"
+            )
+            raise gr.Error(msg)
+    for delete_file in delete_files:
+        store_set.remove(delete_file)
+        res = TRANSPORTER.remove_file(pathlib.Path(delete_file).name)
+    initialize_store()
+    progress(100, desc="Fertig!")
+
+
+def db_query(question: QAQuestion) -> List[DocumentSource]:
+    """Queries the vector store with a question.
+
+    The number of sources that are returned is defined by the max_sources parameter
+    of the service's configuration.
+
+    Parameters:
+        question: The question to query the vector store with.
 
     Returns:
-        str: Status message about the upload result.
+        A list of document sources
     """
-    global store
-    if not files:
-        return "No files uploaded."
-    result = ""
-    for file in files:
-        with open(file.name, "rb") as f:
-            data = f.read()
-        qa_file = QAFileUpload(name=file.name, data=data)
-        res = TRANSPORTER.add_file(qa_file)
-        if res.status != 200:
-            return f"Upload failed: {res.error_msg}"
-        result += f"{file.name} indexed successfully\n"
-
-    # Reload FAISS after indexing
-    initialize_store()
-    if store is not None:
-        _LOGGER.info("Vectors after upload: %d", store.index.ntotal)
-    return result
+    if not self._vectorstore:
+        return []
+    return [
+        DocumentSource(
+            query=question.question,
+            content=doc.page_content,
+            name=doc.metadata.get("source", "unknown"),
+            page=doc.metadata.get("page", 1),
+        )
+        for doc in self._vectorstore.search(
+            question.question,
+            search_type=question.search_strategy,
+            k=question.max_sources,
+        )
+    ]
 
 
 # -----------------------------
@@ -183,6 +233,17 @@ def query(
         error_msg = f"QA Query failed: {str(e)}"
         raise gr.Error(error_msg) from e
 
+    # start db search mode
+    db_res = TRANSPORTER.db_query(q)
+    if not db_res:
+        msg = f"Database query returned empty!"
+        raise gr.Error(msg)
+    output = ""
+    for doc in db_res:
+        output += f"{doc.content}\n"
+        output += f"({doc.name} / {doc.page})\n----------\n\n"
+    return output
+
 
 # -----------------------------
 # Gradio UI
@@ -224,6 +285,8 @@ with demo:
 
     # Events
     file_upload.upload(fn=files_changed, inputs=file_upload, outputs=upload_status)
+    file_upload.delete(fn=files_changed, inputs=file_upload, outputs=upload_status)
+    file_upload.clear(fn=files_changed, inputs=file_upload, outputs=upload_status)
     type_radio.change(fn=change_model, inputs=type_radio)
     submit_btn.click(
         fn=query,
