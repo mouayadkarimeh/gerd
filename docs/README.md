@@ -36,12 +36,12 @@ When the server is done loading, open `http://127.0.0.1:7860` in your browser.
 
 ```shell
 gradio gerd/frontends/qa_frontend.py
-# Some Llama.cpp outut
+# Some Llama.cpp output
 # ...
 # * Running on local URL:  http://127.0.0.1:7860
 ```
 
-Click the 'Click to Upload' button and search for a [GRASCCO](https://pubmed.ncbi.nlm.nih.gov/36073490/) document named `Caja.txt` which is located in the `tests/data/grascoo` folder and upload it into the vector store. Next, you can query information from the document. For instance `Wie heißt der Patient?` (What is the patient called?).
+Click the 'Click to Upload' button and search for a [GRASCCO](https://pubmed.ncbi.nlm.nih.gov/36073490/) document named `Caja.txt` which is located in the `tests/data/grascco` folder and upload it into the vector store. Next, you can query information from the document. For instance `Wie heißt der Patient?` (What is the patient called?).
 
 ![](media/qa.png)
 
