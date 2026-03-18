@@ -1,70 +1,27 @@
 """RAG Frontend for GERD.
 
 This module implements a Gradio-based frontend
-for the Retrieval-Augmented Generation (RAG)
-system in GERD. It allows users to upload documents, ask questions,
+for the Retrieval-Augmented Generation (RAG) system in GERD.
+It allows users to upload documents, ask questions,
 and view relevant sources and answers.
 """
 
 import logging
 import pathlib
-from os import unlink
-from pathlib import Path
-from tempfile import NamedTemporaryFile
-from typing import List, Optional
-from xml.dom.minidom import Document
+from typing import Optional
 
 import gradio as gr
-from jinja2 import BaseLoader
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_community.vectorstores import FAISS
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from gerd.backends import TRANSPORTER
 from gerd.config import CONFIG, load_qa_config
-from gerd.rag import create_faiss, load_faiss
-from gerd.transport import DocumentSource, FileTypes, QAAnswer, QAFileUpload, QAQuestion
+from gerd.transport import QAFileUpload, QAQuestion
 
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.addHandler(logging.NullHandler())
 qa_config = load_qa_config()
 model_config = qa_config.model
 store: FAISS | None = None
-
-
-# -----------------------------
-# Initialize FAISS Index
-# -----------------------------
-def initialize_store() -> None:
-    """Vector store initialization.
-
-    Sets the `store` variable to a FAISS index if it exists.
-    otherwise None. This is called at startup and after file uploads to ensure the index
-    is up-to-date.
-
-    Parameter:
-        none
-
-    Returns:
-        none
-    """
-    global store
-    if (
-        qa_config.embedding.db_path
-        and Path(qa_config.embedding.db_path, "index.faiss").exists()
-    ):
-        _LOGGER.info("faiss path does not exist %s", qa_config.embedding.db_path)
-        store = load_faiss(
-            qa_config.embedding.db_path,
-            qa_config.embedding.model.name,
-            qa_config.device,
-        )
-    else:
-        _LOGGER.info(
-            "FAISS index not found at %s. Please upload documents to create the index.",
-            qa_config.embedding.db_path,
-        )
-        store = None
 
 
 # -----------------------------
@@ -81,8 +38,11 @@ def change_model(name: str) -> None:
     Returns:
         none
     """
+    _LOGGER.info("Before Changing model to: %s", name)
     model_config.name = name
-    _LOGGER.info("Model switched to: %s", name)
+    qa_config.model = model_config
+    _LOGGER.info("Model switched to: %s", model_config.name)
+    _LOGGER.info("Current QA Config: %s", qa_config)
 
 
 store_set: set[str] = set()
@@ -127,68 +87,7 @@ def files_changed(file_paths: Optional[list[str]]) -> None:
     for delete_file in delete_files:
         store_set.remove(delete_file)
         res = TRANSPORTER.remove_file(pathlib.Path(delete_file).name)
-    initialize_store()
     progress(100, desc="Fertig!")
-
-
-def db_query(question: QAQuestion) -> List[DocumentSource]:
-    """Queries the vector store with a question.
-
-    The number of sources that are returned is defined by the max_sources parameter
-    of the service's configuration.
-
-    Parameters:
-        question: The question to query the vector store with.
-
-    Returns:
-        A list of document sources
-    """
-    if not self._vectorstore:
-        return []
-    return [
-        DocumentSource(
-            query=question.question,
-            content=doc.page_content,
-            name=doc.metadata.get("source", "unknown"),
-            page=doc.metadata.get("page", 1),
-        )
-        for doc in self._vectorstore.search(
-            question.question,
-            search_type=question.search_strategy,
-            k=question.max_sources,
-        )
-    ]
-
-
-# -----------------------------
-# Retrieve Sources
-# -----------------------------
-def return_relevant_sources(question: QAQuestion) -> str:
-    """Retrieve relevant sources for a given question.
-
-    Parameters:
-        question (QAQuestion): The question object.
-
-    Returns:
-        str: the relevant Sources returned as str.
-    """
-    global store
-    if store is None:
-        return "Vector store not initialized. Upload documents first."
-
-    # Use the same search method as QAService
-    docs = store.search(
-        question.question, search_type=question.search_strategy, k=question.max_sources
-    )
-
-    if not docs:
-        return "No relevant sources found."
-
-    context = "\n\n".join(
-        f"📄 Source: {doc.metadata.get('source', 'unknown')}\n{doc.page_content}"
-        for doc in docs
-    )
-    return context
 
 
 # -----------------------------
@@ -208,6 +107,7 @@ def query(
     Returns:
         tuple[str, str]: A tuple containing the answer and the relevant sources.
     """
+    gesamt_context = ""
     _LOGGER.info("no_think: %s", no_think)
     q = QAQuestion(
         question=question,
@@ -217,9 +117,12 @@ def query(
     )
 
     try:
-        context = return_relevant_sources(q)
+        context = TRANSPORTER.db_query(q)
     except Exception as e:
         context = f"Source retrieval error: {e}"
+    for cnt in context:
+        # _LOGGER.info("Retrieved source: %s", cnt.content[:100])
+        gesamt_context += cnt.content + "\n\n"
 
     try:
         qa_res = TRANSPORTER.qa_query(q)
@@ -227,22 +130,11 @@ def query(
         if qa_res.status != 200:
             error_msg = f"Query failed: {qa_res.error_msg} (Code {qa_res.status})"
             raise gr.Error(error_msg) from None
-        return qa_res.response, context
+        return qa_res.response, gesamt_context
 
     except Exception as e:
         error_msg = f"QA Query failed: {str(e)}"
         raise gr.Error(error_msg) from e
-
-    # start db search mode
-    db_res = TRANSPORTER.db_query(q)
-    if not db_res:
-        msg = f"Database query returned empty!"
-        raise gr.Error(msg)
-    output = ""
-    for doc in db_res:
-        output += f"{doc.content}\n"
-        output += f"({doc.name} / {doc.page})\n----------\n\n"
-    return output
 
 
 # -----------------------------
@@ -302,9 +194,8 @@ with demo:
 # Start App
 # -----------------------------
 if __name__ == "__main__":
-    initialize_store()
     from gerd.config import CONFIG
 
-    logging.basicConfig(level=logging.WARNING)
+    logging.basicConfig(level=logging.INFO)
     logging.getLogger("gerd").setLevel(CONFIG.logging.level.value.upper())
     demo.launch()
