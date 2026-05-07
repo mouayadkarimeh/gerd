@@ -9,7 +9,7 @@ import abc
 import logging
 import os
 from pathlib import Path
-from typing import Iterator, TypeGuard
+from typing import TYPE_CHECKING, Any, Iterator, TypeGuard
 
 from typing_extensions import override
 
@@ -17,6 +17,9 @@ from gerd.models.model import ChatMessage, ChatRole, ModelConfig, ModelEndpoint
 
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.addHandler(logging.NullHandler())
+
+if TYPE_CHECKING:
+    from requests import Response
 
 
 class LLM:
@@ -163,7 +166,9 @@ class TransformerLLM(LLM):
             "float64": torch.float64,
         }
 
-        model_kwargs = config.extra_kwargs or {}
+        model_kwargs = dict(config.extra_kwargs or {})
+        model_kwargs.pop("enable_thinking", None)
+        model_kwargs.pop("chat_template_kwargs", None)
         if config.torch_dtype in torch_dtypes:
             model_kwargs["torch_dtype"] = torch_dtypes[config.torch_dtype]
 
@@ -231,6 +236,12 @@ class TransformerLLM(LLM):
         self, messages: list[ChatMessage], config: ModelConfig | None = None
     ) -> tuple[ChatRole, str]:
         config = config or self.config
+        if config.extra_kwargs and config.extra_kwargs.get("enable_thinking"):
+            msg = (
+                "enable_thinking is not supported by TransformerLLM. "
+                "Use RemoteLLM with a compatible server."
+            )
+            raise NotImplementedError(msg)
         msg = self._pipe(
             [{"role": m["role"], "content": m["content"]} for m in messages],
             max_new_tokens=config.max_new_tokens,
@@ -308,27 +319,21 @@ class RemoteLLM(LLM):
             _LOGGER.warning("Server returned error code %d", res.status_code)
         return ""
 
-    @override
-    def create_chat_completion(
-        self, messages: list[ChatMessage], config: ModelConfig | None = None
-    ) -> tuple[ChatRole, str]:
-        import json
-
-        import requests
-
-        config = config or self.config
-        if config.endpoint is None:
-            msg = "Endpoint is required for remote LLM"
-            raise ValueError(msg)
-
+    def _build_chat_completion_request(
+        self, messages: list[ChatMessage], config: ModelConfig
+    ) -> tuple[dict[str, str], dict[str, Any]]:
         headers = {"Content-Type": "application/json"}
-        if config.endpoint.key:
+        if config.endpoint and config.endpoint.key:
             headers["Authorization"] = (
                 f"Bearer {config.endpoint.key.get_secret_value()}"
             )
 
+        if config.endpoint is None:
+            msg = "Endpoint is required for remote LLM"
+            raise ValueError(msg)
+
         if config.endpoint.type == "openai":
-            req = {
+            req: dict[str, Any] = {
                 "model": config.name,
                 "temperature": config.temperature,
                 "frequency_penalty": config.repetition_penalty,
@@ -337,6 +342,7 @@ class RemoteLLM(LLM):
                 "stop": config.stop,
                 "top_p": config.top_p,
             }
+            self._apply_openai_extra_kwargs(req, config)
         elif config.endpoint.type == "llama.cpp":
             req = {
                 "temperature": config.temperature,
@@ -351,6 +357,71 @@ class RemoteLLM(LLM):
             raise ValueError(msg)
 
         req["messages"] = messages
+        return headers, req
+
+    @staticmethod
+    def _apply_openai_extra_kwargs(req: dict[str, Any], config: ModelConfig) -> None:
+        if not config.extra_kwargs:
+            return
+
+        for key in (
+            "enable_thinking",
+            "top_k",
+            "min_p",
+            "presence_penalty",
+            "repetition_penalty",
+        ):
+            if key in config.extra_kwargs:
+                req[key] = config.extra_kwargs[key]
+
+    def _parse_openai_chat_response(self, res: "Response") -> tuple[ChatRole, str]:
+        try:
+            j = res.json()
+        except Exception as e:  # pragma: no cover - defensive
+            msg = "Invalid JSON response from model server"
+            _LOGGER.exception(msg)
+            raise ValueError(msg) from e
+
+        if not isinstance(j, dict) or "choices" not in j:
+            msg = "Model server returned unexpected response structure: " f"{res.text}"
+            _LOGGER.error(msg)
+            raise ValueError(msg)
+
+        try:
+            res_message: dict[str, str] = j["choices"][0]["message"]
+        except Exception as e:  # pragma: no cover - defensive
+            msg = "Model server response missing choices/message"
+            _LOGGER.exception(msg)
+            _LOGGER.error("Full response text: %s", res.text)
+            raise ValueError(msg) from e
+
+        if _is_valid_role(res_message.get("role", "")):
+            content = (res_message.get("content") or "").strip()
+            reasoning_content = res_message.get("reasoning_content")
+            if reasoning_content:
+                reasoning = str(reasoning_content).strip()
+                if reasoning:
+                    # Reuse the existing rag.py parser to surface reasoning in UI.
+                    content = f"<think>{reasoning}</think>{content}"
+            return (res_message.get("role", "assistant"), content)
+
+        msg = "Unknown role: %s" % res_message.get("role")
+        _LOGGER.error(msg)
+        raise ValueError(msg)
+
+    @override
+    def create_chat_completion(
+        self, messages: list[ChatMessage], config: ModelConfig | None = None
+    ) -> tuple[ChatRole, str]:
+        import json
+
+        import requests
+
+        config = config or self.config
+        if config.endpoint is None:
+            msg = "Endpoint is required for remote LLM"
+            raise ValueError(msg)
+        headers, req = self._build_chat_completion_request(messages, config)
         res = requests.post(
             config.endpoint.url + "/v1/chat/completions",
             headers=headers,
@@ -358,12 +429,7 @@ class RemoteLLM(LLM):
             timeout=300,
         )
         if res.status_code == 200:
-            res_message: dict[str, str] = res.json()["choices"][0]["message"]
-            if _is_valid_role(res_message["role"]):
-                return (res_message["role"], res_message["content"].strip())
-            msg = "Unknown role: %s" % res_message["role"]
-            _LOGGER.error(msg)
-            raise ValueError(msg)
+            return self._parse_openai_chat_response(res)
         else:
             _LOGGER.warning("Server returned error code %d", res.status_code)
         return ("assistant", "")

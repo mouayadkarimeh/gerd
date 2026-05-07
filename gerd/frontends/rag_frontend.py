@@ -16,12 +16,15 @@ from langchain_community.vectorstores import FAISS
 
 from gerd.backends import TRANSPORTER
 from gerd.config import CONFIG, load_qa_config
+from gerd.models.model import ModelEndpoint
 from gerd.transport import QAFileUpload, QAQuestion
 
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.addHandler(logging.NullHandler())
 _MODEL_SWITCH_LOCK = threading.Lock()
 _CURRENT_MODEL = load_qa_config().model.name
+_CURRENT_CHUNK_SIZE = load_qa_config().embedding.chunk_size
+_CURRENT_CHUNK_OVERLAP = load_qa_config().embedding.chunk_overlap
 
 
 # -----------------------------
@@ -45,9 +48,57 @@ def change_model(name: str) -> None:
         _LOGGER.info("Changing model to: %s", name)
         qa_config = load_qa_config()
         qa_config.model.name = name
+        # If the selected model is Qwen3.5, use LM Studio's OpenAI-compatible endpoint.
+        # For other models, ensure no remote endpoint is set so the loader will choose
+        # the local transformers/llama.cpp path.
+        if "qwen3.5" in name.lower():
+            qa_config.model.endpoint = ModelEndpoint(
+                url="http://localhost:8000",
+                type="openai",
+                key=None,
+            )
+        else:
+            qa_config.model.endpoint = None
         TRANSPORTER.reinit_qa_service(qa_config)
+        # _LOGGER.info("config: %s", qa_config)
         _CURRENT_MODEL = name
-        _LOGGER.info("Model successfully switched to: %s", name)
+        # _LOGGER.info("Model successfully switched to: %s", name )
+
+
+def change_embedding_param(chunk_size: int, chunk_overlap: int) -> None:
+    """Change the embedding parameters for the vectorstore.
+
+    This function is called when the chunk size or overlap sliders are changed.
+    It updates the QA service with the new embedding parameters.
+
+    Returns:
+        none
+    """
+    global _CURRENT_CHUNK_SIZE, _CURRENT_CHUNK_OVERLAP
+    with _MODEL_SWITCH_LOCK:
+        if (
+            chunk_size == _CURRENT_CHUNK_SIZE
+            and chunk_overlap == _CURRENT_CHUNK_OVERLAP
+        ):
+            return
+        qa_config = load_qa_config()
+        qa_config.model.name = _CURRENT_MODEL
+        # If the selected model is Qwen3.5, use LM Studio's OpenAI-compatible endpoint.
+        # For other models, ensure no remote endpoint is set so the loader will choose
+        # the local transformers/llama.cpp path.
+        if "qwen3.5" in _CURRENT_MODEL.lower():
+            qa_config.model.endpoint = ModelEndpoint(
+                url="http://localhost:8000",
+                type="openai",
+                key=None,
+            )
+        else:
+            qa_config.model.endpoint = None
+        qa_config.embedding.chunk_size = chunk_size
+        qa_config.embedding.chunk_overlap = chunk_overlap
+        TRANSPORTER.reinit_qa_service(qa_config)
+        _CURRENT_CHUNK_SIZE = chunk_size
+        _CURRENT_CHUNK_OVERLAP = chunk_overlap
 
 
 store_set: set[str] = set()
@@ -85,8 +136,8 @@ def files_changed(file_paths: Optional[list[str]]) -> None:
                 res.error_msg,
             )
             msg = (
-                f"Datei konnte nicht hochgeladen werden: {res.error_msg}"
-                "(Error Code {res.status})"
+                f"Datei konnte nicht hochgeladen werden: {res.error_msg} "
+                f"(Error Code {res.status})"
             )
             raise gr.Error(msg)
     for delete_file in delete_files:
@@ -99,18 +150,29 @@ def files_changed(file_paths: Optional[list[str]]) -> None:
 # Query LLM
 # -----------------------------
 def query(
-    question: str, k_source: int, strategy: str, no_think: bool, model_name: str
-) -> tuple[str, str]:
+    question: str,
+    k_source: int,
+    strategy: str,
+    thinking: str,
+    model_name: str,
+    chunk_size: int,
+    chunk_overlap: int,
+) -> tuple[str, str, str]:
     """Handle the QA query.
 
     Parameters:
         question (str): The user's question.
         k_source (int): The number of sources to retrieve.
         strategy (str): The search strategy to use ("similarity" or "mmr").
-        no_think (bool): Whether to disable the "thinking" step in the LLM.
+        thinking (str): The thinking mode ("Default", "Think", or "No Think").
+        model_name (str): The name of the model to use.
+        chunk_size (int): The size of the text chunks for searching.
+        chunk_overlap (int): The overlap between text chunks for searching.
+
 
     Returns:
-        tuple[str, str]: A tuple containing the answer and the relevant sources.
+        tuple[str, str, str]: A tuple containing the answer, thoughts,
+        and the relevant sources.
     """
     # Guarantees query and model selection stay in sync even if events race.
     if model_name != _CURRENT_MODEL:
@@ -120,14 +182,19 @@ def query(
             _CURRENT_MODEL,
         )
         change_model(model_name)
-
+    change_embedding_param(chunk_size, chunk_overlap)
+    think = None
+    if thinking == "Think":
+        think = True
+    elif thinking == "No Think":
+        think = False
     gesamt_context = ""
-    _LOGGER.info("no_think: %s", no_think)
+    _LOGGER.info("think: %s", think)
     q = QAQuestion(
         question=question,
         search_strategy=strategy,
         max_sources=k_source,
-        no_think=no_think,
+        think=think,
     )
 
     try:
@@ -144,7 +211,7 @@ def query(
         if qa_res.status != 200:
             error_msg = f"Query failed: {qa_res.error_msg} (Code {qa_res.status})"
             raise gr.Error(error_msg) from None
-        return qa_res.response, gesamt_context
+        return qa_res.response, qa_res.thoughts, gesamt_context
 
     except Exception as e:
         error_msg = f"QA Query failed: {str(e)}"
@@ -166,25 +233,66 @@ with demo:
                 file_types=[".txt", ".pdf"], label="Upload Documents"
             )
         with gr.Column(scale=2):
-            think_box = gr.Checkbox(value=False, label="no_think Mode")
+            think_radio = gr.Radio(
+                choices=["Default", "Think", "No Think"],
+                value="Default",
+                label="Thinking Mode",
+                info="Thinking-Verhalten für Reasoning Modelle",
+            )
             type_radio = gr.Radio(
-                choices=["qwen/qwen2.5-0.5B-instruct", "qwen/qwen3-0.6B"],
-                value="qwen/qwen3-0.6B",
+                choices=[
+                    "Qwen/Qwen2.5-0.5B-Instruct",
+                    "Qwen/Qwen3-0.6B",
+                    "Qwen/Qwen3.5-0.8B",
+                    "Qwen/Qwen3.5-9B",
+                ],
+                value=_CURRENT_MODEL,
                 label="Model",
             )
-            k_slider = gr.Slider(
+            slider_returned_sources = gr.Slider(
                 minimum=1, maximum=10, step=1, value=3, label="Number of Sources"
+            )
+            slider_chunk_size = gr.Slider(
+                minimum=64,
+                maximum=512,
+                step=64,
+                value=256,
+                label="Chunk Size",
+                info="Größe der Textstücke für die Suche",
+            )
+            slider_chunk_overlap = gr.Slider(
+                minimum=0,
+                maximum=50,
+                step=5,
+                value=25,
+                label="Chunk Overlap",
+                info="Überlappung der Textstücke.",
             )
             strategy_dropdown = gr.Dropdown(
                 choices=["similarity", "mmr"],
                 value="similarity",
                 label="Search Strategy",
+                info=(
+                    "Suchstrategie anhand der die relevanten Quellen abgerufen werden. "
+                    "'similarity' ruft die ähnlichsten Quellen ab, während "
+                    "'mmr' (Maximal Marginal Relevance) eine abwechslungsreiche Menge "
+                    "an Quellen abruft, die für die Abfrage relevant sind."
+                ),
             )
     question_box = gr.Textbox(label="Question", placeholder="Ask a question...")
 
     with gr.Row():
-        source_box = gr.Textbox(label="Relevant Sources", lines=10)
-        answer_box = gr.Textbox(label="Answer", lines=10)
+        source_box = gr.Textbox(
+            label="Relevant Sources", lines=10, info="relevante Quellen für RAG Antwort"
+        )
+        thoughts_box = gr.Textbox(
+            label="Thoughts",
+            lines=10,
+            info="gedankliche Prozesse dzrch Reasining Modell",
+        )
+        answer_box = gr.Textbox(
+            label="Answer", lines=10, info="saubere Antwort ohne Kontext oder Gedanken"
+        )
 
     upload_status = gr.Textbox(label="Upload Status")
     submit_btn = gr.Button("Submit", variant="primary")
@@ -194,15 +302,37 @@ with demo:
     file_upload.delete(fn=files_changed, inputs=file_upload, outputs=upload_status)
     file_upload.clear(fn=files_changed, inputs=file_upload, outputs=upload_status)
     type_radio.change(fn=change_model, inputs=type_radio)
+    slider_chunk_size.change(
+        fn=change_embedding_param, inputs=[slider_chunk_size, slider_chunk_overlap]
+    )
+    slider_chunk_overlap.change(
+        fn=change_embedding_param, inputs=[slider_chunk_size, slider_chunk_overlap]
+    )
     submit_btn.click(
         fn=query,
-        inputs=[question_box, k_slider, strategy_dropdown, think_box, type_radio],
-        outputs=[answer_box, source_box],
+        inputs=[
+            question_box,
+            slider_returned_sources,
+            strategy_dropdown,
+            think_radio,
+            type_radio,
+            slider_chunk_size,
+            slider_chunk_overlap,
+        ],
+        outputs=[answer_box, thoughts_box, source_box],
     )
     question_box.submit(
         fn=query,
-        inputs=[question_box, k_slider, strategy_dropdown, think_box, type_radio],
-        outputs=[answer_box, source_box],
+        inputs=[
+            question_box,
+            slider_returned_sources,
+            strategy_dropdown,
+            think_radio,
+            type_radio,
+            slider_chunk_size,
+            slider_chunk_overlap,
+        ],
+        outputs=[answer_box, thoughts_box, source_box],
     )
 # -----------------------------
 # Start App
@@ -212,4 +342,5 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("gerd").setLevel(CONFIG.logging.level.value.upper())
-    demo.launch()
+    # Show detailed exceptions in the browser UI to make 500 root causes visible.
+    demo.launch(show_error=True)

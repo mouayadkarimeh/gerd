@@ -125,12 +125,6 @@ class QAService:
         Returns:
             The answer from the language model
         """
-        if question.no_think and not question.question.strip().startswith("/no_think"):
-            question.question = f"/no_think {question.question.strip()}"
-            _LOGGER.warning(
-                "Applied /no_think prefix to question: %s", question.question
-            )
-
         if not self._database:
             if not self._vectorstore:
                 return QAAnswer(error_msg="No database available!", status=404)
@@ -580,3 +574,26 @@ class QAService:
         if len(ids) > 0:
             self._vectorstore.delete(ids)
         return QAAnswer(status=200)
+
+    def reinit_qa_service(self, qa_config: QAConfig) -> None:
+        """Reinitialize the QA service with a new configuration.
+
+        This method is used when the model is switched
+        to update the QA service with the new model.
+        Keeps the existing vector store (uploaded/indexed documents)
+        and resets the internal Rag runtime so it is
+        recreated on the next query.
+
+        Parameters:
+            qa_config: The new configuration for the QA service
+        Returns:
+            None
+        """
+        old_vectorstore = self._vectorstore
+        self.config = qa_config
+        self._llm = gerd_loader.load_model_from_config(qa_config.model)
+        _LOGGER.info(
+            "QA service reinitialized with new model: %s", qa_config.model.name
+        )
+        self._vectorstore = old_vectorstore
+        self._database = None

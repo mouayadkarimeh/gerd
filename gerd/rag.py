@@ -111,8 +111,20 @@ class Rag:
         context = "\n".join(doc.page_content for doc in docs)
         resolved = self.prompt.text.format(context=context, question=question.question)
 
+        request_config = self.model_config
+        if (
+            question.think is not None
+            and self.model_config.endpoint
+            and self.model_config.endpoint.type == "openai"
+        ):
+            request_config = self.model_config.model_copy(deep=True)
+            request_config.extra_kwargs = dict(request_config.extra_kwargs or {})
+            request_config.extra_kwargs["enable_thinking"] = question.think
+            _LOGGER.debug(
+                "Applied enable_thinking=%s via request extra_kwargs",
+                question.think,
+            )
         # Apply /think or /no_think prefix if specified in the question
-        # TODO: Does not work for Qwen3.5
         if question.think is False:
             resolved = f"/no_think {resolved.lstrip()}"
             _LOGGER.debug("Applied /no_think prefix")
@@ -121,7 +133,7 @@ class Rag:
             _LOGGER.debug("Applied /think prefix")
 
         _, response = self.model.create_chat_completion(
-            [{"role": "user", "content": resolved}]
+            [{"role": "user", "content": resolved}], config=request_config
         )
         thoughts = None
         if "</think>" in response:
