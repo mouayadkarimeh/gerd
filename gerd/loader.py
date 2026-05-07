@@ -322,6 +322,18 @@ class RemoteLLM(LLM):
     def _build_chat_completion_request(
         self, messages: list[ChatMessage], config: ModelConfig
     ) -> tuple[dict[str, str], dict[str, Any]]:
+        """Builds the request for chat completion based on the endpoint type.
+
+        For OpenAI-compatible endpoints, the request follows the OpenAI API format.
+        For llama.cpp endpoints, the request follows the llama.cpp server API format.
+
+        Parameters:
+            messages: The list of messages in the chat history
+            config: The model configuration
+
+        Returns:
+            A tuple of headers and the request body
+        """
         headers = {"Content-Type": "application/json"}
         if config.endpoint and config.endpoint.key:
             headers["Authorization"] = (
@@ -361,6 +373,17 @@ class RemoteLLM(LLM):
 
     @staticmethod
     def _apply_openai_extra_kwargs(req: dict[str, Any], config: ModelConfig) -> None:
+        """Applies extra kwargs for OpenAI-compatible endpoints.
+
+        Some features like enable_thinking are only supported by
+        OpenAI-compatible endpoints.
+
+        Parameters:
+            req: The request body to be sent to the endpoint
+            config: The model configuration containing extra kwargs
+        Returns:
+            None
+        """
         if not config.extra_kwargs:
             return
 
@@ -375,6 +398,13 @@ class RemoteLLM(LLM):
                 req[key] = config.extra_kwargs[key]
 
     def _parse_openai_chat_response(self, res: "Response") -> tuple[ChatRole, str]:
+        """Parses the response from an OpenAI-compatible chat completion endpoint.
+
+        Parameters:
+            res: The response object from the requests library
+        Returns:
+            A tuple of the role and content of the parsed response
+        """
         try:
             j = res.json()
         except Exception as e:  # pragma: no cover - defensive
@@ -413,6 +443,14 @@ class RemoteLLM(LLM):
     def create_chat_completion(
         self, messages: list[ChatMessage], config: ModelConfig | None = None
     ) -> tuple[ChatRole, str]:
+        """Creates a chat completion by sending a request to the remote endpoint.
+
+        Parameters:
+            messages: The list of messages in the chat history
+            config: Optional model configuration to override the default one
+        Returns:
+            A tuple of the role and content of the generated message
+        """
         import json
 
         import requests
@@ -436,6 +474,13 @@ class RemoteLLM(LLM):
 
 
 def _is_valid_role(role: str) -> TypeGuard[ChatRole]:
+    """Checks if the role is a valid ChatRole.
+
+    Parameters:
+        role: The role to check
+    Returns:
+            True if the role is valid, False otherwise
+    """
     return role in {"user", "assistant", "system"}
 
 

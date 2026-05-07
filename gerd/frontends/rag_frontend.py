@@ -71,6 +71,10 @@ def change_embedding_param(chunk_size: int, chunk_overlap: int) -> None:
     This function is called when the chunk size or overlap sliders are changed.
     It updates the QA service with the new embedding parameters.
 
+    Parameters:
+        chunk_size (int): The new chunk size for text splitting.
+        chunk_overlap (int): The new chunk overlap for text splitting.
+
     Returns:
         none
     """
@@ -114,7 +118,9 @@ def files_changed(file_paths: Optional[list[str]]) -> None:
     have been removed.
 
     Parameters:
-        file_paths: The file paths to upload
+        file_paths (Optional[list[str]]): The file paths to upload
+    Returns:
+        none
     """
     file_paths = file_paths or []
     progress = gr.Progress()
