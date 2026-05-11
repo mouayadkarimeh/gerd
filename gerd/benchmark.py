@@ -601,6 +601,70 @@ def clean_gt_value(label: str, value: Optional[str]) -> str:
     return v
 
 
+DATE_LABELS = {"PatientGeburtsdatum", "AufnahmeDatum", "EntlassungsDatum"}
+
+
+def _matches_label_prefix(
+    pred_norm: str, label: str, gt_raw: str, pred_raw: str
+) -> bool:
+    """Check whether a prediction matches a label-specific prefix rule."""
+    prefixes = LABEL_PREFIXES.get(label, [])
+    gt_norm = normalize(gt_raw)
+    for prefix in prefixes:
+        prefix_norm = prefix.lower()
+        if not pred_norm.startswith(prefix_norm):
+            continue
+
+        rest = pred_norm[len(prefix_norm) :].strip()
+        if label == "PatientName":
+            if normalize(remove_titles(rest)) == normalize(remove_titles(gt_norm)):
+                return True
+            continue
+
+        if label in DATE_LABELS:
+            d1 = extract_date(gt_raw)
+            d2 = extract_date(pred_raw)
+            if d1 and d2 and d1 == d2:
+                return True
+
+    return False
+
+
+def _evaluate_date_prediction(
+    gt_raw: str, pred_raw: str, gt_norm: str, pred_norm: str
+) -> Tuple[float, bool]:
+    """Evaluate date labels."""
+    d1 = extract_date(gt_raw)
+    d2 = extract_date(pred_raw)
+    if d1 and d2 and d1 == d2:
+        return 1.0, True
+    if gt_norm and pred_norm and gt_norm == pred_norm:
+        return 1.0, True
+    score = levenshtein_ratio(gt_norm, pred_norm)
+    return score, score >= FUZZY_THRESHOLD
+
+
+def _evaluate_name_prediction(gt_norm: str, pred_norm: str) -> Tuple[float, bool]:
+    """Evaluate name labels."""
+    gt_clean = normalize(remove_titles(gt_norm))
+    pred_clean = normalize(remove_titles(pred_norm))
+
+    if gt_clean and pred_clean and (gt_clean in pred_clean or pred_clean in gt_clean):
+        return 1.0, True
+
+    if gt_clean and pred_clean and set(gt_clean.split()) == set(pred_clean.split()):
+        return 1.0, True
+
+    score = levenshtein_ratio(gt_clean, pred_clean)
+    return score, score >= FUZZY_THRESHOLD
+
+
+def _evaluate_generic_prediction(gt_norm: str, pred_norm: str) -> Tuple[float, bool]:
+    """Evaluate remaining labels."""
+    score = levenshtein_ratio(gt_norm, pred_norm)
+    return score, score >= FUZZY_THRESHOLD
+
+
 def remove_titles(s: Optional[str]) -> str:
     """Remove common titles like "Herr", "Frau", etc.
 
@@ -638,6 +702,57 @@ def load_grascco_annotations() -> Dict[str, dict]:
     return dict(sorted(mapping.items()))
 
 
+def _first_label_result(annotation_entry: dict, label: str) -> dict | None:
+    """Return the first annotation result that matches a label."""
+    if not annotation_entry or "annotations" not in annotation_entry:
+        return None
+
+    annotations = annotation_entry["annotations"]
+    if not annotations:
+        return None
+
+    results = annotations[0].get("result", [])
+    for result in results:
+        labels = result.get("value", {}).get("labels") or []
+        if labels and labels[0] == label:
+            return result
+    return None
+
+
+def _slice_annotation_candidate(text: str, start: int | None, end: int | None) -> str:
+    """Extract a candidate snippet from text around a label annotation."""
+    if (
+        isinstance(start, int)
+        and isinstance(end, int)
+        and 0 <= start < end <= len(text)
+    ):
+        candidate = safe_slice_text(text, start, end).strip()
+        if candidate:
+            return candidate
+
+    text_norm = text.replace("\r\n", "\n")
+    for delta in range(-12, 13):
+        slice_start = max(0, (start or 0) + delta)
+        slice_end = min(len(text_norm), (end or 0) + delta)
+        if slice_start < slice_end:
+            part = text_norm[slice_start:slice_end].strip()
+            if part and len(part) <= 200:
+                return part
+
+    tokens = re.findall(r"\S+", text_norm)
+    if tokens and isinstance(start, int):
+        char_pos = 0
+        for idx, token in enumerate(tokens):
+            token_start = char_pos
+            token_end = char_pos + len(token)
+            if token_start <= start <= token_end:
+                snippet = " ".join(tokens[max(0, idx - 2) : min(len(tokens), idx + 3)])
+                return snippet.strip()
+            char_pos = token_end + 1
+
+    return ""
+
+
 def extract_label_text(annotation_entry: dict, label: str, text: str) -> str:
     """Extract the text for a given label from the annotation entry.
 
@@ -649,57 +764,24 @@ def extract_label_text(annotation_entry: dict, label: str, text: str) -> str:
     Returns:
         str: Der extrahierte Text oder ein leerer String.
     """
-    if not annotation_entry or "annotations" not in annotation_entry or not text:
+    if not text:
         return ""
 
-    ann = annotation_entry["annotations"][0]
-    results = ann.get("result", [])
-    for r in results:
-        lbls = r.get("value", {}).get("labels") or []
-        if not lbls:
-            continue
-        if lbls[0] != label:
-            continue
-
-        start = r.get("value", {}).get("start")
-        end = r.get("value", {}).get("end")
-        # direct slice
-        try:
-            if (
-                isinstance(start, int)
-                and isinstance(end, int)
-                and 0 <= start < end <= len(text)
-            ):
-                candidate = safe_slice_text(text, start, end).strip()
-                if candidate:
-                    return candidate
-        except Exception:
-            _LOGGER.exception("Fehler beim direkten Slice der Annotation")
-
-        # try small offsets
-        t_norm = text.replace("\r\n", "\n")
-        for delta in range(-12, 13):
-            s = max(0, (start or 0) + delta)
-            e = min(len(t_norm), (end or 0) + delta)
-            if s < e:
-                part = t_norm[s:e].strip()
-                if part and len(part) <= 200:
-                    return part
-
-        # fallback: token neighborhood
-        tokens = re.findall(r"\S+", t_norm)
-        if tokens:
-            char_pos = 0
-            for idx, tok in enumerate(tokens):
-                tok_start = char_pos
-                tok_end = char_pos + len(tok)
-                if isinstance(start, int) and tok_start <= start <= tok_end:
-                    snippet = " ".join(
-                        tokens[max(0, idx - 2) : min(len(tokens), idx + 3)]
-                    )
-                    return snippet.strip()
-                char_pos = tok_end + 1
+    result = _first_label_result(annotation_entry, label)
+    if result is None:
         return ""
+
+    value = result.get("value", {})
+    start = value.get("start")
+    end = value.get("end")
+
+    try:
+        candidate = _slice_annotation_candidate(text, start, end)
+        if candidate:
+            return candidate
+    except Exception:
+        _LOGGER.exception("Fehler beim Extrahieren der Annotation")
+
     return ""
 
 
@@ -769,56 +851,19 @@ def evaluate_prediction(gt: str, pred: str, label: str) -> Tuple[float, bool]:
         return 0.0, False
 
     # 2) Prefix-basiertes Exact-Match (falls prediction "patient: Anna")
-    if label in LABEL_PREFIXES:
-        for prefix in LABEL_PREFIXES[label]:
-            p = prefix.lower()
-            if pred_norm.startswith(p):
-                rest = pred_norm[len(p) :].strip()
-                if label == "PatientName":
-                    rest_clean = normalize(remove_titles(rest))
-                    if rest_clean == normalize(remove_titles(gt_norm)):
-                        return 1.0, True
-                if label in {
-                    "PatientGeburtsdatum",
-                    "AufnahmeDatum",
-                    "EntlassungsDatum",
-                }:
-                    d1 = extract_date(gt_raw)
-                    d2 = extract_date(pred_raw)
-                    if d1 and d2 and d1 == d2:
-                        return 1.0, True
+    if _matches_label_prefix(pred_norm, label, gt_raw, pred_raw):
+        return 1.0, True
 
     # 3) Datum-Labels: extrahiere und vergleiche robust
-    if label in {"PatientGeburtsdatum", "AufnahmeDatum", "EntlassungsDatum"}:
-        d1 = extract_date(gt_raw)
-        d2 = extract_date(pred_raw)
-        if d1 and d2 and d1 == d2:
-            return 1.0, True
-        # fallback: try normalized string equality (z.B. same dd.mm.yyyy)
-        if gt_norm and pred_norm and gt_norm == pred_norm:
-            return 1.0, True
+    if label in DATE_LABELS:
+        return _evaluate_date_prediction(gt_raw, pred_raw, gt_norm, pred_norm)
 
     # 4) Name-Label: heuristiken + levensthein
     if label == "PatientName":
-        gt_clean = normalize(remove_titles(gt_norm))
-        pred_clean = normalize(remove_titles(pred_norm))
-
-        if (
-            gt_clean
-            and pred_clean
-            and (gt_clean in pred_clean or pred_clean in gt_clean)
-        ):
-            return 1.0, True
-
-        if gt_clean and pred_clean and set(gt_clean.split()) == set(pred_clean.split()):
-            return 1.0, True
-
-        score = levenshtein_ratio(gt_clean, pred_clean)
-        return score, score >= FUZZY_THRESHOLD
+        return _evaluate_name_prediction(gt_norm, pred_norm)
 
     # 5) Allgemeiner Fallback
-    score = levenshtein_ratio(gt_norm, pred_norm)
-    return score, score >= FUZZY_THRESHOLD
+    return _evaluate_generic_prediction(gt_norm, pred_norm)
 
 
 def make_prompt_german(text: str, question: str, no_think: bool) -> str:
@@ -875,6 +920,89 @@ Question:
 """.strip()
 
 
+def _extract_prediction_text(qa_res: object) -> str:
+    """Extract the prediction text from different response shapes."""
+    if isinstance(qa_res, tuple) and len(qa_res) == 2:
+        return qa_res[1] or ""
+    if hasattr(qa_res, "response"):
+        return qa_res.response or ""  # type: ignore[union-attr]
+    if isinstance(qa_res, dict) and "response" in qa_res:
+        return qa_res.get("response") or ""
+    return ""
+
+
+def _process_benchmark_questions(
+    fname: str,
+    annotation_entry: dict,
+    text: str,
+    use_rag: bool,
+    no_think_option: bool,
+    question_key: str,
+) -> tuple[list[dict], int, int]:
+    """Run the benchmark questions for a single file."""
+    rows: list[dict] = []
+    total = 0
+    correct = 0
+
+    for question in QUESTIONS:
+        total += 1
+        label = LABEL_MAPPING[question]
+        truth_answer = extract_label_text(annotation_entry, label, text)
+        prompt = make_prompt_englich(
+            text=text, question=question, no_think=no_think_option
+        )
+
+        if use_rag:
+            qa_result = TRANSPORTER.qa_query(
+                QAQuestion(
+                    question=prompt,
+                    search_strategy="similarity",
+                    max_sources=3,
+                    no_think=no_think_option,
+                )
+            )
+        else:
+            try:
+                qa_result = llm.create_chat_completion(
+                    messages=[{"role": "user", "content": prompt}]
+                )
+            except Exception as exc:
+                _LOGGER.warning(
+                    "WARNUNG: LLM-Aufruf für %s ist fehlgeschlagen: %s", fname, exc
+                )
+                qa_result = None
+
+        pred_answer = _extract_prediction_text(qa_result)
+        score, match = evaluate_prediction(truth_answer, pred_answer, label)
+        if match:
+            correct += 1
+
+        _LOGGER.info(
+            "%s | %s | Q: %s | GT: %s | PRED: %s | score=%.2f | match=%s",
+            fname,
+            label,
+            question,
+            truth_answer,
+            pred_answer,
+            score,
+            match,
+        )
+
+        rows.append(
+            {
+                "file": fname,
+                question_key: question,
+                "label": label,
+                "ground_truth": truth_answer,
+                "predicted": pred_answer,
+                "match_score": f"{score:.3f}",
+                "match": match,
+            }
+        )
+
+    return rows, total, correct
+
+
 # BENCHMARK-Funktions
 
 
@@ -929,76 +1057,17 @@ def run_bmk(max_files: int, use_rag: bool, no_think_option: bool) -> None:
                 _LOGGER.error("Upload failed for %s", fname)
                 continue
 
-        if use_rag:
-            for question in QUESTIONS:
-                total += 1
-                label = LABEL_MAPPING[question]
-                truth_answer = extract_label_text(annotation_entry, label, text)
-                prompt = make_prompt_englich(
-                    text=text, question=question, no_think=no_think_option
-                )
-                # _LOGGER.info(prompt)
-                q = QAQuestion(
-                    question=prompt,
-                    search_strategy="similarity",
-                    max_sources=3,
-                    no_think=no_think_option,
-                )
-
-                qa_res = TRANSPORTER.qa_query(q)
-                pred_answer = qa_res.response
-        else:
-            for question in QUESTIONS:
-                total += 1
-                label = LABEL_MAPPING[question]
-                truth_answer = extract_label_text(annotation_entry, label, text)
-                prompt = make_prompt_englich(
-                    text=text, question=question, no_think=no_think_option
-                )
-                try:
-                    qa_res = llm.create_chat_completion(
-                        messages=[{"role": "user", "content": prompt}]
-                    )
-                except Exception as e:
-                    _LOGGER.warning(
-                        "WARNUNG: LLM-Aufruf für %s ist fehlgeschlagen: %s", fname, e
-                    )
-                    qa_res = None
-
-                pred_answer = ""
-                if isinstance(qa_res, tuple) and len(qa_res) == 2:
-                    pred_answer = qa_res[1] or ""
-                else:
-                    if hasattr(qa_res, "response"):
-                        pred_answer = qa_res.response or ""
-                    elif isinstance(qa_res, dict) and "response" in qa_res:
-                        pred_answer = qa_res.get("response") or ""
-                    else:
-                        pred_answer = ""
-
-            # pred = clean_pred(pred_answer)
-
-            score, match = evaluate_prediction(truth_answer, pred_answer, label)
-
-            if match:
-                correct += 1
-
-            _LOGGER.info(
-                "%s | %s | Q: %s | GT: %s | " "PRED: %s | score=%.2f | match=%s",
-                (fname, label, question, truth_answer, pred_answer, score, match),
-            )
-
-            rows.append(
-                {
-                    "file": fname,
-                    "label": label,
-                    "question_used": question,
-                    "ground_truth": truth_answer,
-                    "predicted": pred_answer,
-                    "match_score": f"{score:.3f}",
-                    "match": match,
-                }
-            )
+        batch_rows, batch_total, batch_correct = _process_benchmark_questions(
+            fname=fname,
+            annotation_entry=annotation_entry,
+            text=text,
+            use_rag=use_rag,
+            no_think_option=no_think_option,
+            question_key="question_used",
+        )
+        rows.extend(batch_rows)
+        total += batch_total
+        correct += batch_correct
 
     # ---
     # Final metrics
@@ -1062,77 +1131,17 @@ def run_bmk_onefile(file_path: Path, use_rag: bool, no_think_option: bool) -> No
         if getattr(res, "status", None) != 200:
             _LOGGER.error("Fehler beim Laden: %s", getattr(res, "error_msg", res))
 
-    if use_rag:
-        for question in QUESTIONS:
-            total += 1
-            label = LABEL_MAPPING[question]
-            truth_answer = extract_label_text(annotation_entry, label, text)
-            prompt = make_prompt_englich(text, question, no_think_option)
-            _LOGGER.info("prompt: %s", prompt)
-            qa_question = QAQuestion(
-                question=prompt,
-                search_strategy="similarity",
-                max_sources=3,
-                no_think=no_think_option,
-            )
-            qa_answer = TRANSPORTER.qa_query(qa_question)
-            pred_answer = qa_answer.response
-            # _LOGGER.info("RAG-Antwort: %s", pred_answer)
-
-    else:
-        for question in QUESTIONS:
-            total += 1
-            label = LABEL_MAPPING[question]
-            truth_answer = extract_label_text(annotation_entry, label, text)
-            prompt = make_prompt_englich(text, question, no_think_option)
-        try:
-            qa_res = llm.create_chat_completion(
-                messages=[{"role": "user", "content": prompt}]
-            )
-        except Exception as e:
-            _LOGGER.warning(
-                "WARNUNG: LLM-Aufruf für %s ist fehlgeschlagen: %s", fname, e
-            )
-            qa_res = None
-
-        pred = ""
-        if isinstance(qa_res, tuple) and len(qa_res) == 2:
-            pred = qa_res[1] or ""
-        else:
-            if hasattr(qa_res, "response"):
-                pred = qa_res.response or ""
-            elif isinstance(qa_res, dict) and "response" in qa_res:
-                pred = qa_res.get("response") or ""
-            else:
-                pred = ""
-
-        # pred = clean_pred(pred)
-
-        score, match = evaluate_prediction(truth_answer, pred, label)
-        if match:
-            correct += 1
-
-        _LOGGER.info(
-            "%s | %s | Q: %s | GT: %s | PRED: %s | score=%.2f | match=%s",
-            fname,
-            question,
-            truth_answer,
-            pred,
-            score,
-            match,
-        )
-
-        rows.append(
-            {
-                "file": fname,
-                "question": question,
-                "label": label,
-                "ground_truth": truth_answer,
-                "predicted": pred,
-                "match_score": f"{score:.3f}",
-                "match": match,
-            }
-        )
+    batch_rows, batch_total, batch_correct = _process_benchmark_questions(
+        fname=fname,
+        annotation_entry=annotation_entry,
+        text=text,
+        use_rag=use_rag,
+        no_think_option=no_think_option,
+        question_key="question",
+    )
+    rows.extend(batch_rows)
+    total += batch_total
+    correct += batch_correct
 
     acc = correct / total if total else 0
     _LOGGER.info("================================================")
