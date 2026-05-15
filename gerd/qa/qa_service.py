@@ -589,11 +589,9 @@ class QAService:
         Returns:
             None
         """
-        old_vectorstore = self._vectorstore
         self.config = qa_config
         self._llm = gerd_loader.load_model_from_config(qa_config.model)
         _LOGGER.info(
             "QA service reinitialized with new model: %s", qa_config.model.name
         )
-        self._vectorstore = old_vectorstore
         self._database = None

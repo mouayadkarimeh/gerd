@@ -237,11 +237,10 @@ class TransformerLLM(LLM):
     ) -> tuple[ChatRole, str]:
         config = config or self.config
         if config.extra_kwargs and config.extra_kwargs.get("enable_thinking"):
-            msg = (
-                "enable_thinking is not supported by TransformerLLM. "
-                "Use RemoteLLM with a compatible server."
+            _LOGGER.warning(
+                "enable_thinking is not supported by TransformerLLM, ignoring. "
+                "Use RemoteLLM with a compatible server for thinking support."
             )
-            raise NotImplementedError(msg)
         msg = self._pipe(
             [{"role": m["role"], "content": m["content"]} for m in messages],
             max_new_tokens=config.max_new_tokens,
@@ -355,18 +354,9 @@ class RemoteLLM(LLM):
                 "top_p": config.top_p,
             }
             self._apply_openai_extra_kwargs(req, config)
-        elif config.endpoint.type == "llama.cpp":
-            req = {
-                "temperature": config.temperature,
-                "top_k": config.top_k,
-                "top_p": config.top_p,
-                "repeat_penalty": config.repetition_penalty,
-                "n_predict": config.max_new_tokens,
-                "stop": config.stop or [],
-            }
         else:
-            msg = f"Unknown endpoint type: {config.endpoint.type}"
-            raise ValueError(msg)
+            msg = f"Endpoint type '{config.endpoint.type}' is not supported"
+            raise NotImplementedError(msg)
 
         req["messages"] = messages
         return headers, req
