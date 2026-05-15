@@ -17,7 +17,7 @@ from langchain_community.vectorstores import FAISS
 from gerd.backends import TRANSPORTER
 from gerd.config import CONFIG, load_qa_config
 from gerd.models.model import ModelEndpoint
-from gerd.transport import QAFileUpload, QAQuestion
+from gerd.transport import DocumentSource, QAFileUpload, QAQuestion
 
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.addHandler(logging.NullHandler())
@@ -203,10 +203,11 @@ def query(
         think=think,
     )
 
+    context: list[DocumentSource] = []
     try:
         context = TRANSPORTER.db_query(q)
     except Exception as e:
-        context = f"Source retrieval error: {e}"
+        _LOGGER.exception("Source retrieval error: %s", e)
     for cnt in context:
         # _LOGGER.info("Retrieved source: %s", cnt.content[:100])
         gesamt_context += cnt.content + "\n" + "******************************" + "\n\n"
@@ -217,7 +218,8 @@ def query(
         if qa_res.status != 200:
             error_msg = f"Query failed: {qa_res.error_msg} (Code {qa_res.status})"
             raise gr.Error(error_msg) from None
-        return qa_res.response, qa_res.thoughts, gesamt_context
+        thoughts = qa_res.thoughts or ""
+        return qa_res.response, thoughts, gesamt_context
 
     except Exception as e:
         error_msg = f"QA Query failed: {str(e)}"

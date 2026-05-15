@@ -9,7 +9,7 @@ import abc
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, TypeGuard
+from typing import TYPE_CHECKING, Any, Iterator, TypeGuard, cast
 
 from typing_extensions import override
 
@@ -423,7 +423,8 @@ class RemoteLLM(LLM):
                 if reasoning:
                     # Reuse the existing rag.py parser to surface reasoning in UI.
                     content = f"<think>{reasoning}</think>{content}"
-            return (res_message.get("role", "assistant"), content)
+            role = cast(ChatRole, res_message.get("role", "assistant"))
+            return (role, content)
 
         msg = "Unknown role: %s" % res_message.get("role")
         _LOGGER.error(msg)

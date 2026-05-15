@@ -9,6 +9,7 @@ from typing_extensions import override
 
 from gerd.backends.bridge import Bridge
 from gerd.config import CONFIG
+from gerd.models.qa import QAConfig
 from gerd.transport import (
     DocumentSource,
     GenResponse,
@@ -152,6 +153,10 @@ class RestServer(Transport):
     @override
     def clear_vectorstore(self) -> QAAnswer:
         return self._bridge.clear_vectorstore()
+
+    @override
+    def reinit_qa_service(self, qa_config: QAConfig) -> None:
+        self._bridge.reinit_qa_service(qa_config)
 
 
 app = FastAPI()
