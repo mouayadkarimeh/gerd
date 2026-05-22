@@ -73,12 +73,12 @@ class MockLLM(LLM):
         pass
 
     @override
-    def generate(self, _unused: str, _not_used: ModelConfig | None = None) -> str:
+    def generate(self, _unused: str, config: ModelConfig | None = None) -> str:
         return self.ret_value
 
     @override
     def create_chat_completion(
-        self, _unused: list[ChatMessage], _not_used: ModelConfig | None = None
+        self, _unused: list[ChatMessage], config: ModelConfig | None = None
     ) -> tuple[ChatRole, str]:
         return ("assistant", self.ret_value)
 
