@@ -109,7 +109,7 @@ def train_lora(
         [
             lora_config.tokenizer(
                 lora_config.tokenizer.apply_chat_template(
-                    cast(List[dict[str, str]], sample.messages), tokenize=False
+                    cast("List[dict[str, str]]", sample.messages), tokenize=False
                 )
             )
             for sample in data.samples

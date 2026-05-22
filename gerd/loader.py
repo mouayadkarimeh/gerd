@@ -423,7 +423,7 @@ class RemoteLLM(LLM):
                 if reasoning:
                     # Reuse the existing rag.py parser to surface reasoning in UI.
                     content = f"<think>{reasoning}</think>{content}"
-            role = cast(ChatRole, res_message.get("role", "assistant"))
+            role = cast("ChatRole", res_message.get("role", "assistant"))
             return (role, content)
 
         msg = "Unknown role: %s" % res_message.get("role")
