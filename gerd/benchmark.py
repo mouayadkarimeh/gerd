@@ -690,7 +690,18 @@ def _matches_label_prefix(
 def _evaluate_date_prediction(
     gt_raw: str, pred_raw: str, gt_norm: str, pred_norm: str
 ) -> Tuple[float, bool]:
-    """Evaluate date labels."""
+    """Evaluate date labels.
+
+    Parameters:
+        gt_raw (str): The raw ground truth value.
+        pred_raw (str): The raw predicted value.
+        gt_norm (str): The normalized ground truth value.
+        pred_norm (str): The normalized predicted value.
+
+    Returns:
+        Tuple[float, bool]: The similarity score and whether it is considered correct.
+
+    """
     d1 = extract_date(gt_raw)
     d2 = extract_date(pred_raw)
     if d1 and d2 and d1 == d2:
@@ -702,7 +713,15 @@ def _evaluate_date_prediction(
 
 
 def _evaluate_name_prediction(gt_norm: str, pred_norm: str) -> Tuple[float, bool]:
-    """Evaluate name labels."""
+    """Evaluate name labels.
+
+    Parameters:
+        gt_norm (str): The normalized ground truth value.
+        pred_norm (str): The normalized predicted value.
+
+    Returns:
+        Tuple[float, bool]: The similarity score.
+    """
     gt_clean = normalize(remove_titles(gt_norm))
     pred_clean = normalize(remove_titles(pred_norm))
 
@@ -717,7 +736,15 @@ def _evaluate_name_prediction(gt_norm: str, pred_norm: str) -> Tuple[float, bool
 
 
 def _evaluate_generic_prediction(gt_norm: str, pred_norm: str) -> Tuple[float, bool]:
-    """Evaluate remaining labels."""
+    """Evaluate remaining labels.
+
+    Parameters:
+        gt_norm (str): The normalized ground truth value.
+        pred_norm (str): The normalized predicted value.
+
+    Returns:
+        Tuple[float, bool]: The similarity score and whether it is considered correct.
+    """
     score = levenshtein_ratio(gt_norm, pred_norm)
     return score, score >= FUZZY_THRESHOLD
 
@@ -1027,7 +1054,19 @@ def _process_benchmark_questions(
     no_think_option: bool,
     question_key: str,
 ) -> tuple[list[dict], int, int]:
-    """Run the benchmark questions for a single file."""
+    """Run the benchmark questions for a single file.
+
+    Parameter:
+        fname (str): The name of the file being processed.
+        annotation_entry (dict): The annotation entry for the file.
+        text (str): The text content of the file.
+        use_rag (bool): Whether to use the RAG approach.
+        no_think_option (bool): Whether to activate the '/no_think' option in prompts.
+        question_key (str): The key to use for the question in the results.
+
+    Returns:
+        tuple[list[dict], int, int]: A tuple containing the list of result rows,
+    """
     rows: list[dict] = []
     total = 0
     correct = 0
